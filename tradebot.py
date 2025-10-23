@@ -1,67 +1,77 @@
-import time
-from datetime import datetime, time as dtime
+import os
 import yfinance as yf
+from datetime import datetime
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
-API_KEY = "PKLQFRGIDZI7L2MBEZ3TGBOZEY"
-SECRET_KEY = "3hW9TartmCaLuYHRUPumUN5Qd3R822Xoda8tc5FPbQmM"
+# === SETUP ===
+API_KEY = os.getenv("ALPACA_API_KEY")
+SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 
+# Initialize Alpaca client
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 
+# Stocks to trade
+symbols = ["AAPL", "MSFT", "TSLA", "NVDA"]
+
+# === FUNCTIONS ===
 def get_latest_data(symbol):
-    df = yf.download(symbol, period="6mo", interval="1d", progress=False)
-    df = df[['Close']].rename(columns={'Close': 'close'})
-    df['sma_short'] = df['close'].rolling(window=3).mean()
-    df['sma_long'] = df['close'].rolling(window=7).mean()
-    return df
+    """Fetch last 5 days of price data."""
+    try:
+        df = yf.download(symbol, period="5d", interval="30m", progress=False)
+        return df
+    except Exception as e:
+        print(f"Error fetching {symbol}: {e}")
+        return None
 
 def get_signal(df):
-    if len(df) < 7:
+    """Simple momentum signal based on moving averages."""
+    if df is None or df.empty:
         return "HOLD"
-    if df['sma_short'].iloc[-1] > df['sma_long'].iloc[-1]:
+    df["SMA5"] = df["Close"].rolling(5).mean()
+    df["SMA20"] = df["Close"].rolling(20).mean()
+    if df["SMA5"].iloc[-1] > df["SMA20"].iloc[-1]:
         return "BUY"
-    elif df['sma_short'].iloc[-1] < df['sma_long'].iloc[-1]:
+    elif df["SMA5"].iloc[-1] < df["SMA20"].iloc[-1]:
         return "SELL"
     else:
         return "HOLD"
 
-def trade(symbol):
+# === MAIN LOOP (runs once) ===
+print(f"\n🚀 Trade bot started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+for symbol in symbols:
     df = get_latest_data(symbol)
     signal = get_signal(df)
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {symbol} → {signal}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {symbol}: Signal = {signal}")
 
-    position = None
+    # Check current position
     try:
         position = trading_client.get_open_position(symbol)
     except:
         position = None
 
     if signal == "BUY" and not position:
-        order = trading_client.submit_order(
-            symbol=symbol, qty=2, side=OrderSide.BUY, type="market", time_in_force=TimeInForce.GTC
+        order = MarketOrderRequest(
+            symbol=symbol,
+            qty=2,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.GTC
         )
-        print(f"✅ Bought 2 shares of {symbol}")
+        trading_client.submit_order(order)
+        print(f"✅ Placed BUY order for {symbol}")
     elif signal == "SELL" and position:
-        order = trading_client.submit_order(
-            symbol=symbol, qty=position.qty, side=OrderSide.SELL, type="market", time_in_force=TimeInForce.GTC
+        order = MarketOrderRequest(
+            symbol=symbol,
+            qty=abs(int(float(position.qty))),
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.GTC
         )
-        print(f"🟥 Sold {symbol}")
+        trading_client.submit_order(order)
+        print(f"🟥 Placed SELL order for {symbol}")
     else:
-        print("No trade action taken.")
+        print(f"➖ No trade action for {symbol}")
 
-symbols = ["AAPL", "TSLA", "MSFT"]
+print("\n✅ Trade check complete. Exiting cleanly.\n")
 
-MARKET_OPEN = dtime(9, 30)
-MARKET_CLOSE = dtime(16, 0)
-
-while True:
-    now = datetime.now().time()
-    if MARKET_OPEN <= now <= MARKET_CLOSE:
-        for symbol in symbols:
-            trade(symbol)
-        time.sleep(300)
-    else:
-        print(f"Market closed. Sleeping at {datetime.now():%H:%M:%S}")
-        time.sleep(1800)
