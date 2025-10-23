@@ -13,7 +13,7 @@ SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 
 # Stocks to trade
-symbols = ["AAPL", "MSFT", "TSLA", "NVDA"]
+symbols = ["AAPL", "MSFT", "TSLA", "NVDA", "PLTR", "CRSP"]
 
 # === FUNCTIONS ===
 def get_latest_data(symbol):
