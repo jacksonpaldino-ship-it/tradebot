@@ -1,77 +1,87 @@
 import os
-import yfinance as yf
 from datetime import datetime
+import pandas as pd
+import numpy as np
 from alpaca.trading.client import TradingClient
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
-# === SETUP ===
+# ==============================
+# 🔐 API KEYS
+# ==============================
 API_KEY = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 
-# Initialize Alpaca client
+# ✅ Connect to Alpaca (paper trading)
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
+data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
-# Stocks to trade
+# ==============================
+# ⚙️ Strategy parameters
+# ==============================
 symbols = ["AAPL", "MSFT", "TSLA", "NVDA", "PLTR", "CRSP"]
+short_window = 5
+long_window = 20
 
-# === FUNCTIONS ===
-def get_latest_data(symbol):
-    """Fetch last 5 days of price data."""
-    try:
-        df = yf.download(symbol, period="5d", interval="30m", progress=False)
-        return df
-    except Exception as e:
-        print(f"Error fetching {symbol}: {e}")
-        return None
+# ==============================
+# 📈 Helper: Get signal
+# ==============================
+def get_signal(symbol):
+    request = StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=TimeFrame.Day,
+        limit=long_window + 1
+    )
+    bars = data_client.get_stock_bars(request).df
+    bars = bars[bars.index.get_level_values("symbol") == symbol]
 
-def get_signal(df):
-    """Simple momentum signal based on moving averages."""
-    if df is None or df.empty:
-        return "HOLD"
-    df["SMA5"] = df["Close"].rolling(5).mean()
-    df["SMA20"] = df["Close"].rolling(20).mean()
-    if df["SMA5"].iloc[-1] > df["SMA20"].iloc[-1]:
+    bars["SMA_Short"] = bars["close"].rolling(short_window).mean()
+    bars["SMA_Long"] = bars["close"].rolling(long_window).mean()
+
+    if bars["SMA_Short"].iloc[-2] < bars["SMA_Long"].iloc[-2] and bars["SMA_Short"].iloc[-1] > bars["SMA_Long"].iloc[-1]:
         return "BUY"
-    elif df["SMA5"].iloc[-1] < df["SMA20"].iloc[-1]:
+    elif bars["SMA_Short"].iloc[-2] > bars["SMA_Long"].iloc[-2] and bars["SMA_Short"].iloc[-1] < bars["SMA_Long"].iloc[-1]:
         return "SELL"
     else:
         return "HOLD"
 
-# === MAIN LOOP (runs once) ===
-print(f"\n🚀 Trade bot started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-
-for symbol in symbols:
-    df = get_latest_data(symbol)
-    signal = get_signal(df)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {symbol}: Signal = {signal}")
-
-    # Check current position
+# ==============================
+# 💸 Helper: Place trade
+# ==============================
+def place_trade(symbol, side):
     try:
-        position = trading_client.get_open_position(symbol)
-    except:
-        position = None
-
-    if signal == "BUY" and not position:
-        order = MarketOrderRequest(
-            symbol=symbol,
-            qty=2,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.GTC
+        order = trading_client.submit_order(
+            MarketOrderRequest(
+                symbol=symbol,
+                qty=1,
+                side=OrderSide.BUY if side == "BUY" else OrderSide.SELL,
+                time_in_force=TimeInForce.GTC
+            )
         )
-        trading_client.submit_order(order)
-        print(f"✅ Placed BUY order for {symbol}")
-    elif signal == "SELL" and position:
-        order = MarketOrderRequest(
-            symbol=symbol,
-            qty=abs(int(float(position.qty))),
-            side=OrderSide.SELL,
-            time_in_force=TimeInForce.GTC
-        )
-        trading_client.submit_order(order)
-        print(f"🟥 Placed SELL order for {symbol}")
-    else:
-        print(f"➖ No trade action for {symbol}")
+        print(f"✅ {side} order placed for {symbol}")
+    except Exception as e:
+        print(f"⚠️ Failed to place {side} order for {symbol}: {e}")
 
-print("\n✅ Trade check complete. Exiting cleanly.\n")
+# ==============================
+# 🚀 Main
+# ==============================
+def main():
+    print(f"\n=== Running trade bot at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
+    for symbol in symbols:
+        signal = get_signal(symbol)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {symbol}: Signal = {signal}")
 
+        if signal == "BUY":
+            place_trade(symbol, "BUY")
+        elif signal == "SELL":
+            place_trade(symbol, "SELL")
+        else:
+            print(f"➖ No trade action for {symbol}")
+
+    print("\n✅ Trade check complete. Exiting cleanly.\n")
+
+if __name__ == "__main__":
+    main()
