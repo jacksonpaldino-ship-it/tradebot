@@ -1,34 +1,60 @@
 import os
+import json
 import yfinance as yf
 import pandas as pd
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, date, time as dtime
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
-# Alpaca credentials from GitHub secrets
+# Alpaca credentials
 API_KEY = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 
-# Stocks to trade
+# Stock list
 SYMBOLS = ["AAPL", "MSFT", "TSLA", "NVDA", "PLTR", "CRSP"]
 
 # === Market Hours Check ===
 MARKET_OPEN = dtime(9, 30)
 MARKET_CLOSE = dtime(16, 0)
 now = datetime.now().time()
-
 if not (MARKET_OPEN <= now <= MARKET_CLOSE):
     print("⏸️ Market is closed — skipping trading until next session.")
     exit()
 
 print(f"=== Tradebot run {datetime.now()} ===")
 
+# === Cooldown Tracking File ===
+COOLDOWN_FILE = "trade_history.json"
+MAX_TRADES_PER_DAY = 2
+
+def load_trade_history():
+    if os.path.exists(COOLDOWN_FILE):
+        with open(COOLDOWN_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_trade_history(history):
+    with open(COOLDOWN_FILE, "w") as f:
+        json.dump(history, f)
+
+def record_trade(symbol):
+    today_str = str(date.today())
+    history = load_trade_history()
+    if today_str not in history:
+        history[today_str] = {}
+    history[today_str][symbol] = history[today_str].get(symbol, 0) + 1
+    save_trade_history(history)
+
+def trades_today(symbol):
+    today_str = str(date.today())
+    history = load_trade_history()
+    return history.get(today_str, {}).get(symbol, 0)
+
 def get_signal(df):
     short_ma = df["Close"].rolling(window=5).mean()
     long_ma = df["Close"].rolling(window=20).mean()
-
     if short_ma.iloc[-1] > long_ma.iloc[-1]:
         return "BUY"
     elif short_ma.iloc[-1] < long_ma.iloc[-1]:
@@ -45,12 +71,12 @@ def place_order(symbol, side):
             time_in_force=TimeInForce.DAY
         )
         trading_client.submit_order(order)
+        record_trade(symbol)
         print(f"✅ Placed {side} order for {symbol}")
     except Exception as e:
         print(f"❌ Order failed for {symbol}: {e}")
 
 def main():
-    total_pnl = 0
     for symbol in SYMBOLS:
         print(f"\nChecking {symbol}...")
         try:
@@ -63,6 +89,10 @@ def main():
 
             signal = get_signal(df)
             print(f"[{datetime.now().strftime('%H:%M:%S')}] {symbol}: Signal = {signal}")
+
+            if trades_today(symbol) >= MAX_TRADES_PER_DAY:
+                print(f"🕓 Cooldown active — already traded {symbol} {MAX_TRADES_PER_DAY}x today.")
+                continue
 
             positions = trading_client.get_all_positions()
             held_symbols = [p.symbol for p in positions]
@@ -77,20 +107,8 @@ def main():
         except Exception as e:
             print(f"Failed bars for {symbol}: {e}")
 
-    # Calculate daily P&L
-    try:
-        today = datetime.now().date()
-        closed_orders = trading_client.get_orders(status="closed")
-        pnl_today = sum(
-            float(o.filled_avg_price or 0) * (1 if o.side == "sell" else -1)
-            for o in closed_orders
-            if o.submitted_at and o.submitted_at.date() == today
-        )
-        print(f"\nDaily P&L: ${pnl_today:.2f}")
-    except Exception as e:
-        print(f"Error calculating P&L: {e}")
-
     print("\n✅ Trade check complete. Exiting cleanly.\n")
 
 if __name__ == "__main__":
     main()
+
