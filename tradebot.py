@@ -1,154 +1,95 @@
 # tradebot.py
 import os
-import time
-import smtplib
-import pandas as pd
+import requests
 import yfinance as yf
 from datetime import datetime, time as dtime
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
-# --- API keys from GitHub secrets ---
+# === CONFIG ===
 API_KEY = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-EMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
-EMAIL_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
-
-trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
-
-# --- Market hours ---
+EMAIL_TO = "jackson.paldino@icloud.com"
 MARKET_OPEN = dtime(9, 30)
 MARKET_CLOSE = dtime(16, 0)
+SYMBOLS = ["AAPL", "MSFT", "TSLA", "NVDA", "PLTR", "CRSP"]
 
-# --- Stock list and cooldown tracking ---
-symbols = ["AAPL", "MSFT", "TSLA", "NVDA", "PLTR", "CRSP"]
-trade_log = {s: [] for s in symbols}
-daily_trades = []
+# === SETUP ===
+trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 
-# --- Email helper ---
-def send_email(subject, body):
-    msg = MIMEMultipart()
-    msg["From"] = EMAIL_ADDRESS
-    msg["To"] = EMAIL_ADDRESS
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
+# --- Helper: send email (simple, uses MailThis.to free relay) ---
+def send_email(subject, message):
+    try:
+        requests.post(
+            "https://mailthis.to/jacksonpaldino",
+            data={
+                "email": EMAIL_TO,
+                "subject": subject,
+                "message": message,
+            },
+            timeout=10
+        )
+        print(f"📧 Email sent: {subject}")
+    except Exception as e:
+        print(f"Email error: {e}")
 
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
-        server.starttls()
-        server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-        server.send_message(msg)
-    print(f"📧 Email sent: {subject}")
-
-# --- Data and trading helpers ---
+# --- Strategy functions ---
 def get_latest_data(symbol):
-    """Fetch last 60 days of 15-minute data."""
     df = yf.download(symbol, period="60d", interval="15m", progress=False)
-    if df.empty:
-        raise ValueError(f"No data returned for {symbol}")
-    df = df[["Close"]].rename(columns={"Close": "close"})
-    df["sma_short"] = df["close"].rolling(window=10).mean()
-    df["sma_long"] = df["close"].rolling(window=30).mean()
+    df["sma_short"] = df["Close"].rolling(window=3).mean()
+    df["sma_long"] = df["Close"].rolling(window=7).mean()
     return df.dropna()
 
 def get_signal(df):
-    """Generate BUY/SELL/HOLD signal based on SMA crossovers."""
-    latest_short = df["sma_short"].iloc[-1]
-    latest_long = df["sma_long"].iloc[-1]
-    prev_short = df["sma_short"].iloc[-2]
-    prev_long = df["sma_long"].iloc[-2]
-
-    if prev_short <= prev_long and latest_short > latest_long:
+    if df["sma_short"].iloc[-1] > df["sma_long"].iloc[-1]:
         return "BUY"
-    elif prev_short >= prev_long and latest_short < latest_long:
+    elif df["sma_short"].iloc[-1] < df["sma_long"].iloc[-1]:
         return "SELL"
-    else:
-        return "HOLD"
+    return "HOLD"
 
-def trade(symbol, signal):
-    """Execute trades with cooldown and record actions."""
-    now = datetime.now()
-    trade_log[symbol] = [t for t in trade_log[symbol] if t.date() == now.date()]
-
-    if len(trade_log[symbol]) >= 2:
-        return f"🕒 Cooldown active for {symbol}, skipping."
-
+def trade(symbol):
+    df = get_latest_data(symbol)
+    signal = get_signal(df)
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {symbol}: {signal}")
+    position = None
     try:
         position = trading_client.get_open_position(symbol)
-    except Exception:
-        position = None
+    except:
+        pass
 
     if signal == "BUY" and not position:
         trading_client.submit_order(
-            symbol=symbol,
-            qty=2,
-            side=OrderSide.BUY,
-            type="market",
-            time_in_force=TimeInForce.DAY,
+            MarketOrderRequest(symbol=symbol, qty=2, side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
         )
-        trade_log[symbol].append(now)
-        daily_trades.append(f"✅ Bought 2 shares of {symbol}")
-        return f"✅ Bought 2 shares of {symbol}"
-
+        msg = f"✅ Bought 2 shares of {symbol} at {datetime.now().strftime('%H:%M:%S')}"
+        print(msg)
+        send_email(f"Trade Alert: BUY {symbol}", msg)
     elif signal == "SELL" and position:
         trading_client.submit_order(
-            symbol=symbol,
-            qty=position.qty,
-            side=OrderSide.SELL,
-            type="market",
-            time_in_force=TimeInForce.DAY,
+            MarketOrderRequest(symbol=symbol, qty=position.qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
         )
-        trade_log[symbol].append(now)
-        daily_trades.append(f"🟥 Sold {symbol}")
-        return f"🟥 Sold {symbol}"
-
+        msg = f"🟥 Sold {symbol} at {datetime.now().strftime('%H:%M:%S')}"
+        print(msg)
+        send_email(f"Trade Alert: SELL {symbol}", msg)
     else:
-        return f"➖ No trade action for {symbol}"
+        print(f"➖ No trade action for {symbol}")
 
-# --- Daily P&L summary ---
-def get_daily_summary():
-    try:
-        account = trading_client.get_account()
-        equity = float(account.equity)
-        cash = float(account.cash)
-        return f"Equity: ${equity:,.2f}\nCash: ${cash:,.2f}"
-    except Exception as e:
-        return f"Error fetching account summary: {e}"
-
-# --- Main function ---
+# --- Main run ---
 def main():
     now = datetime.now().time()
     if not (MARKET_OPEN <= now <= MARKET_CLOSE):
-        print(f"⏸ Market closed ({now}), skipping run.")
+        print("Market closed, skipping run.")
         return
 
-    run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log = [f"=== Tradebot run {run_time} ==="]
-
-    for symbol in symbols:
+    print(f"\n=== Tradebot run {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+    for symbol in SYMBOLS:
         try:
-            df = get_latest_data(symbol)
-            signal = get_signal(df)
-            action = trade(symbol, signal)
-            log.append(f"{symbol}: {signal} → {action}")
+            trade(symbol)
         except Exception as e:
-            log.append(f"{symbol}: Error → {e}")
+            print(f"Error trading {symbol}: {e}")
 
-    log.append("\nAccount Summary:\n" + get_daily_summary())
-    message = "\n".join(log)
-    print(message)
-
-    send_email(f"Tradebot Run Report - {run_time}", message)
-
-    # Send daily summary at ~4:05 PM ET
-    if datetime.now().hour == 16 and datetime.now().minute >= 5:
-        summary = "=== End-of-Day Summary ===\n" + "\n".join(daily_trades) + "\n\n" + get_daily_summary()
-        send_email("Tradebot Daily Summary", summary)
-        daily_trades.clear()
-
-    print("✅ Run complete.\n")
+    print("\n✅ Trade check complete. Exiting cleanly.\n")
 
 if __name__ == "__main__":
     main()
