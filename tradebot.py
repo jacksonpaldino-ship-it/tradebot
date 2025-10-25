@@ -1,68 +1,44 @@
+# tradebot.py
 import os
-import json
-import yfinance as yf
+import time
 import pandas as pd
-from datetime import datetime, date, time as dtime
+import yfinance as yf
+from datetime import datetime, time as dtime
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
-# Alpaca credentials
+# --- API keys from GitHub secrets ---
 API_KEY = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 
-# Stock list
-SYMBOLS = ["AAPL", "MSFT", "TSLA", "NVDA", "PLTR", "CRSP"]
-
-# === Market Hours Check ===
+# --- Market hours ---
 MARKET_OPEN = dtime(9, 30)
 MARKET_CLOSE = dtime(16, 0)
-now = datetime.now().time()
-if not (MARKET_OPEN <= now <= MARKET_CLOSE):
-    print("⏸️ Market is closed — skipping trading until next session.")
-    exit()
 
-print(f"=== Tradebot run {datetime.now()} ===")
+# --- Stock symbols and cooldown tracking ---
+symbols = ["AAPL", "MSFT", "TSLA", "NVDA", "PLTR", "CRSP"]
+trade_log = {s: [] for s in symbols}  # store timestamps of trades for cooldown
 
-# === Cooldown Tracking File ===
-COOLDOWN_FILE = "trade_history.json"
-MAX_TRADES_PER_DAY = 2
-
-def load_trade_history():
-    if os.path.exists(COOLDOWN_FILE):
-        with open(COOLDOWN_FILE, "r") as f:
-            return json.load(f)
-    return {}
-
-def save_trade_history(history):
-    with open(COOLDOWN_FILE, "w") as f:
-        json.dump(history, f)
-
-def record_trade(symbol):
-    today_str = str(date.today())
-    history = load_trade_history()
-    if today_str not in history:
-        history[today_str] = {}
-    history[today_str][symbol] = history[today_str].get(symbol, 0) + 1
-    save_trade_history(history)
-
-def trades_today(symbol):
-    today_str = str(date.today())
-    history = load_trade_history()
-    return history.get(today_str, {}).get(symbol, 0)
+# --- Helper functions ---
+def get_latest_data(symbol):
+    """Fetch last 60 days of 15-minute data."""
+    df = yf.download(symbol, period="60d", interval="15m", progress=False)
+    if df.empty:
+        raise ValueError(f"No data returned for {symbol}")
+    df = df[["Close"]].rename(columns={"Close": "close"})
+    df["sma_short"] = df["close"].rolling(window=10).mean()
+    df["sma_long"] = df["close"].rolling(window=30).mean()
+    return df.dropna()
 
 def get_signal(df):
-    """Generate trading signal based on SMA crossover."""
-    if len(df) < 20:
-        return "HOLD"
+    """Generate signal based on SMA crossovers."""
+    latest_short = df["sma_short"].iloc[-1]
+    latest_long = df["sma_long"].iloc[-1]
+    prev_short = df["sma_short"].iloc[-2]
+    prev_long = df["sma_long"].iloc[-2]
 
-    latest_short = df['sma_short'].iloc[-1]
-    latest_long = df['sma_long'].iloc[-1]
-    prev_short = df['sma_short'].iloc[-2]
-    prev_long = df['sma_long'].iloc[-2]
-
-    # Detect crossover: short crosses above long = BUY, crosses below = SELL
     if prev_short <= prev_long and latest_short > latest_long:
         return "BUY"
     elif prev_short >= prev_long and latest_short < latest_long:
@@ -70,53 +46,65 @@ def get_signal(df):
     else:
         return "HOLD"
 
-def place_order(symbol, side):
+def trade(symbol, signal):
+    """Submit trades based on signal, limited to 2 trades/day per symbol."""
+    now = datetime.now()
+
+    # Cooldown: max 2 trades per symbol per day
+    trade_log[symbol] = [
+        t for t in trade_log[symbol] if t.date() == now.date()
+    ]
+    if len(trade_log[symbol]) >= 2:
+        print(f"🕒 Cooldown active for {symbol}, skipping trade.")
+        return
+
     try:
-        order = MarketOrderRequest(
+        position = trading_client.get_open_position(symbol)
+    except Exception:
+        position = None
+
+    if signal == "BUY" and not position:
+        order = trading_client.submit_order(
             symbol=symbol,
-            qty=1,
-            side=OrderSide.BUY if side == "BUY" else OrderSide.SELL,
-            time_in_force=TimeInForce.DAY
+            qty=2,
+            side=OrderSide.BUY,
+            type="market",
+            time_in_force=TimeInForce.DAY,
         )
-        trading_client.submit_order(order)
-        record_trade(symbol)
-        print(f"✅ Placed {side} order for {symbol}")
-    except Exception as e:
-        print(f"❌ Order failed for {symbol}: {e}")
+        trade_log[symbol].append(now)
+        print(f"✅ Bought 2 shares of {symbol}")
+    elif signal == "SELL" and position:
+        order = trading_client.submit_order(
+            symbol=symbol,
+            qty=position.qty,
+            side=OrderSide.SELL,
+            type="market",
+            time_in_force=TimeInForce.DAY,
+        )
+        trade_log[symbol].append(now)
+        print(f"🟥 Sold {symbol}")
+    else:
+        print(f"➖ No trade action for {symbol}")
 
+# --- Main Loop ---
 def main():
-    for symbol in SYMBOLS:
-        print(f"\nChecking {symbol}...")
+    now = datetime.now().time()
+    if not (MARKET_OPEN <= now <= MARKET_CLOSE):
+        print(f"⏸ Market closed ({now}), skipping run.")
+        return
+
+    print(f"=== Tradebot run {datetime.now()} ===")
+
+    for symbol in symbols:
         try:
-            df = yf.download(symbol, period="60d", interval="15m", progress=False)
-            df.dropna(inplace=True)
-
-            if df.empty:
-                print(f"⚠️ No data for {symbol}")
-                continue
-
+            df = get_latest_data(symbol)
             signal = get_signal(df)
             print(f"[{datetime.now().strftime('%H:%M:%S')}] {symbol}: Signal = {signal}")
-
-            if trades_today(symbol) >= MAX_TRADES_PER_DAY:
-                print(f"🕓 Cooldown active — already traded {symbol} {MAX_TRADES_PER_DAY}x today.")
-                continue
-
-            positions = trading_client.get_all_positions()
-            held_symbols = [p.symbol for p in positions]
-
-            if signal == "BUY" and symbol not in held_symbols:
-                place_order(symbol, "BUY")
-            elif signal == "SELL" and symbol in held_symbols:
-                place_order(symbol, "SELL")
-            else:
-                print(f"➖ No trade action for {symbol}")
-
+            trade(symbol, signal)
         except Exception as e:
             print(f"Failed bars for {symbol}: {e}")
 
-    print("\n✅ Trade check complete. Exiting cleanly.\n")
+    print("\n✅ Trade check complete. Exiting cleanly.")
 
 if __name__ == "__main__":
     main()
-
