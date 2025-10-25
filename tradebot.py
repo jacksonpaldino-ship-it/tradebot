@@ -37,31 +37,27 @@ def get_bars(symbol):
         return None
 
 def get_signal(df):
-    """Generate trading signal based on SMA crossover."""
-    # Must have at least enough data to compute both SMAs
-    if "sma_short" not in df.columns or "sma_long" not in df.columns:
-        return "HOLD"
-    if len(df) < 10:
-        return "HOLD"
-
-    # Get last two *rows* explicitly
-    latest = df.tail(1).iloc[0]
-    prev = df.tail(2).iloc[0]
-
-    # Ensure they’re numeric scalars
     try:
-latest_short = float(latest["sma_short"].iloc[0] if hasattr(latest["sma_short"], "iloc") else latest["sma_short"])
-latest_long  = float(latest["sma_long"].iloc[0]  if hasattr(latest["sma_long"], "iloc")  else latest["sma_long"])
-prev_short   = float(prev["sma_short"].iloc[0]   if hasattr(prev["sma_short"], "iloc")   else prev["sma_short"])
-prev_long    = float(prev["sma_long"].iloc[0]    if hasattr(prev["sma_long"], "iloc")    else prev["sma_long"])
-    except Exception:
-        return "HOLD"
+        df["sma_short"] = df["Close"].rolling(window=10).mean()
+        df["sma_long"] = df["Close"].rolling(window=30).mean()
 
-    if latest_short > latest_long and prev_short <= prev_long:
-        return "BUY"
-    elif latest_short < latest_long and prev_short >= prev_long:
-        return "SELL"
-    else:
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        latest_short = float(latest["sma_short"].iloc[0] if hasattr(latest["sma_short"], "iloc") else latest["sma_short"])
+        latest_long  = float(latest["sma_long"].iloc[0]  if hasattr(latest["sma_long"], "iloc")  else latest["sma_long"])
+        prev_short   = float(prev["sma_short"].iloc[0]   if hasattr(prev["sma_short"], "iloc")   else prev["sma_short"])
+        prev_long    = float(prev["sma_long"].iloc[0]    if hasattr(prev["sma_long"], "iloc")    else prev["sma_long"])
+
+        if latest_short > latest_long and prev_short <= prev_long:
+            return "BUY"
+        elif latest_short < latest_long and prev_short >= prev_long:
+            return "SELL"
+        else:
+            return "HOLD"
+
+    except Exception as e:
+        print(f"Error generating signal: {e}")
         return "HOLD"
 
 def place_trade(symbol, side):
