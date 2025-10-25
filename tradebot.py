@@ -37,15 +37,32 @@ def get_bars(symbol):
         return None
 
 def get_signal(df):
-    if df is None or len(df) < 50:
+    """Generate trading signal based on SMA crossover."""
+    # Must have at least enough data to compute both SMAs
+    if "sma_short" not in df.columns or "sma_long" not in df.columns:
         return "HOLD"
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
-    if latest["sma_short"] > latest["sma_long"] and prev["sma_short"] <= prev["sma_long"]:
+    if len(df) < 10:
+        return "HOLD"
+
+    # Get last two *rows* explicitly
+    latest = df.tail(1).iloc[0]
+    prev = df.tail(2).iloc[0]
+
+    # Ensure they’re numeric scalars
+    try:
+        latest_short = float(latest["sma_short"])
+        latest_long = float(latest["sma_long"])
+        prev_short = float(prev["sma_short"])
+        prev_long = float(prev["sma_long"])
+    except Exception:
+        return "HOLD"
+
+    if latest_short > latest_long and prev_short <= prev_long:
         return "BUY"
-    elif latest["sma_short"] < latest["sma_long"] and prev["sma_short"] >= prev["sma_long"]:
+    elif latest_short < latest_long and prev_short >= prev_long:
         return "SELL"
-    return "HOLD"
+    else:
+        return "HOLD"
 
 def place_trade(symbol, side):
     try:
