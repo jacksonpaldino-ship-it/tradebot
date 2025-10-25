@@ -50,10 +50,10 @@ def get_signal(df):
 
     # Ensure they’re numeric scalars
     try:
-        latest_short = float(latest["sma_short"])
-        latest_long = float(latest["sma_long"])
-        prev_short = float(prev["sma_short"])
-        prev_long = float(prev["sma_long"])
+    latest_short = float(latest["sma_short"].iloc[0] if hasattr(latest["sma_short"], "iloc") else latest["sma_short"])
+    latest_long  = float(latest["sma_long"].iloc[0]  if hasattr(latest["sma_long"], "iloc")  else latest["sma_long"])
+    prev_short   = float(prev["sma_short"].iloc[0]   if hasattr(prev["sma_short"], "iloc")   else prev["sma_short"])
+    prev_long    = float(prev["sma_long"].iloc[0]    if hasattr(prev["sma_long"], "iloc")    else prev["sma_long"])
     except Exception:
         return "HOLD"
 
