@@ -53,11 +53,19 @@ def trades_today(symbol):
     return history.get(today_str, {}).get(symbol, 0)
 
 def get_signal(df):
-    short_ma = df["Close"].rolling(window=5).mean()
-    long_ma = df["Close"].rolling(window=20).mean()
-    if short_ma.iloc[-1] > long_ma.iloc[-1]:
+    """Generate trading signal based on SMA crossover."""
+    if len(df) < 20:
+        return "HOLD"
+
+    latest_short = df['sma_short'].iloc[-1]
+    latest_long = df['sma_long'].iloc[-1]
+    prev_short = df['sma_short'].iloc[-2]
+    prev_long = df['sma_long'].iloc[-2]
+
+    # Detect crossover: short crosses above long = BUY, crosses below = SELL
+    if prev_short <= prev_long and latest_short > latest_long:
         return "BUY"
-    elif short_ma.iloc[-1] < long_ma.iloc[-1]:
+    elif prev_short >= prev_long and latest_short < latest_long:
         return "SELL"
     else:
         return "HOLD"
