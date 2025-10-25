@@ -1,9 +1,12 @@
 # tradebot.py
 import os
 import time
+import smtplib
 import pandas as pd
 import yfinance as yf
 from datetime import datetime, time as dtime
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -11,17 +14,35 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 # --- API keys from GitHub secrets ---
 API_KEY = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+EMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
+EMAIL_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 
 # --- Market hours ---
 MARKET_OPEN = dtime(9, 30)
 MARKET_CLOSE = dtime(16, 0)
 
-# --- Stock symbols and cooldown tracking ---
+# --- Stock list and cooldown tracking ---
 symbols = ["AAPL", "MSFT", "TSLA", "NVDA", "PLTR", "CRSP"]
-trade_log = {s: [] for s in symbols}  # store timestamps of trades for cooldown
+trade_log = {s: [] for s in symbols}
+daily_trades = []
 
-# --- Helper functions ---
+# --- Email helper ---
+def send_email(subject, body):
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_ADDRESS
+    msg["To"] = EMAIL_ADDRESS
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+        server.starttls()
+        server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+        server.send_message(msg)
+    print(f"📧 Email sent: {subject}")
+
+# --- Data and trading helpers ---
 def get_latest_data(symbol):
     """Fetch last 60 days of 15-minute data."""
     df = yf.download(symbol, period="60d", interval="15m", progress=False)
@@ -33,7 +54,7 @@ def get_latest_data(symbol):
     return df.dropna()
 
 def get_signal(df):
-    """Generate signal based on SMA crossovers."""
+    """Generate BUY/SELL/HOLD signal based on SMA crossovers."""
     latest_short = df["sma_short"].iloc[-1]
     latest_long = df["sma_long"].iloc[-1]
     prev_short = df["sma_short"].iloc[-2]
@@ -47,16 +68,12 @@ def get_signal(df):
         return "HOLD"
 
 def trade(symbol, signal):
-    """Submit trades based on signal, limited to 2 trades/day per symbol."""
+    """Execute trades with cooldown and record actions."""
     now = datetime.now()
+    trade_log[symbol] = [t for t in trade_log[symbol] if t.date() == now.date()]
 
-    # Cooldown: max 2 trades per symbol per day
-    trade_log[symbol] = [
-        t for t in trade_log[symbol] if t.date() == now.date()
-    ]
     if len(trade_log[symbol]) >= 2:
-        print(f"🕒 Cooldown active for {symbol}, skipping trade.")
-        return
+        return f"🕒 Cooldown active for {symbol}, skipping."
 
     try:
         position = trading_client.get_open_position(symbol)
@@ -64,7 +81,7 @@ def trade(symbol, signal):
         position = None
 
     if signal == "BUY" and not position:
-        order = trading_client.submit_order(
+        trading_client.submit_order(
             symbol=symbol,
             qty=2,
             side=OrderSide.BUY,
@@ -72,9 +89,11 @@ def trade(symbol, signal):
             time_in_force=TimeInForce.DAY,
         )
         trade_log[symbol].append(now)
-        print(f"✅ Bought 2 shares of {symbol}")
+        daily_trades.append(f"✅ Bought 2 shares of {symbol}")
+        return f"✅ Bought 2 shares of {symbol}"
+
     elif signal == "SELL" and position:
-        order = trading_client.submit_order(
+        trading_client.submit_order(
             symbol=symbol,
             qty=position.qty,
             side=OrderSide.SELL,
@@ -82,29 +101,54 @@ def trade(symbol, signal):
             time_in_force=TimeInForce.DAY,
         )
         trade_log[symbol].append(now)
-        print(f"🟥 Sold {symbol}")
-    else:
-        print(f"➖ No trade action for {symbol}")
+        daily_trades.append(f"🟥 Sold {symbol}")
+        return f"🟥 Sold {symbol}"
 
-# --- Main Loop ---
+    else:
+        return f"➖ No trade action for {symbol}"
+
+# --- Daily P&L summary ---
+def get_daily_summary():
+    try:
+        account = trading_client.get_account()
+        equity = float(account.equity)
+        cash = float(account.cash)
+        return f"Equity: ${equity:,.2f}\nCash: ${cash:,.2f}"
+    except Exception as e:
+        return f"Error fetching account summary: {e}"
+
+# --- Main function ---
 def main():
     now = datetime.now().time()
     if not (MARKET_OPEN <= now <= MARKET_CLOSE):
         print(f"⏸ Market closed ({now}), skipping run.")
         return
 
-    print(f"=== Tradebot run {datetime.now()} ===")
+    run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log = [f"=== Tradebot run {run_time} ==="]
 
     for symbol in symbols:
         try:
             df = get_latest_data(symbol)
             signal = get_signal(df)
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] {symbol}: Signal = {signal}")
-            trade(symbol, signal)
+            action = trade(symbol, signal)
+            log.append(f"{symbol}: {signal} → {action}")
         except Exception as e:
-            print(f"Failed bars for {symbol}: {e}")
+            log.append(f"{symbol}: Error → {e}")
 
-    print("\n✅ Trade check complete. Exiting cleanly.")
+    log.append("\nAccount Summary:\n" + get_daily_summary())
+    message = "\n".join(log)
+    print(message)
+
+    send_email(f"Tradebot Run Report - {run_time}", message)
+
+    # Send daily summary at ~4:05 PM ET
+    if datetime.now().hour == 16 and datetime.now().minute >= 5:
+        summary = "=== End-of-Day Summary ===\n" + "\n".join(daily_trades) + "\n\n" + get_daily_summary()
+        send_email("Tradebot Daily Summary", summary)
+        daily_trades.clear()
+
+    print("✅ Run complete.\n")
 
 if __name__ == "__main__":
     main()
