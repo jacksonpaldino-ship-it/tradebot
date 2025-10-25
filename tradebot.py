@@ -1,93 +1,102 @@
-# tradebot.py
 import os
-import requests
+import time
+import pandas as pd
 import yfinance as yf
-from datetime import datetime, time as dtime
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+import alpaca_trade_api as tradeapi
+from datetime import datetime
+import pytz
 
 # === CONFIG ===
 API_KEY = os.getenv("ALPACA_API_KEY")
-SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-EMAIL_TO = "jackson.paldino@icloud.com"
-MARKET_OPEN = dtime(9, 30)
-MARKET_CLOSE = dtime(16, 0)
+API_SECRET = os.getenv("ALPACA_SECRET_KEY")
+BASE_URL = "https://paper-api.alpaca.markets"  # use live URL for live trading
 SYMBOLS = ["AAPL", "MSFT", "TSLA", "NVDA", "PLTR", "CRSP"]
+MAX_TRADES_PER_SYMBOL = 2  # limit per day
 
-# === SETUP ===
-trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
+# Market hours
+MARKET_TZ = pytz.timezone("US/Eastern")
+MARKET_OPEN = datetime.now(MARKET_TZ).replace(hour=9, minute=30, second=0, microsecond=0)
+MARKET_CLOSE = datetime.now(MARKET_TZ).replace(hour=16, minute=0, second=0, microsecond=0)
 
-# --- Helper: send email (simple, uses MailThis.to free relay) ---
-def send_email(subject, message):
+# === INIT ===
+api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version="v2")
+trade_log = {}
+
+def is_market_open():
+    now = datetime.now(MARKET_TZ)
+    return MARKET_OPEN <= now <= MARKET_CLOSE
+
+def get_bars(symbol):
     try:
-        requests.post(
-            "https://mailthis.to/jacksonpaldino",
-            data={
-                "email": EMAIL_TO,
-                "subject": subject,
-                "message": message,
-            },
-            timeout=10
-        )
-        print(f"📧 Email sent: {subject}")
+        df = yf.download(symbol, period="60d", interval="15m", progress=False)
+        df["sma_short"] = df["Close"].rolling(window=10).mean()
+        df["sma_long"] = df["Close"].rolling(window=50).mean()
+        return df
     except Exception as e:
-        print(f"Email error: {e}")
-
-# --- Strategy functions ---
-def get_latest_data(symbol):
-    df = yf.download(symbol, period="60d", interval="15m", progress=False)
-    df["sma_short"] = df["Close"].rolling(window=3).mean()
-    df["sma_long"] = df["Close"].rolling(window=7).mean()
-    return df.dropna()
+        print(f"Failed bars for {symbol}: {e}")
+        return None
 
 def get_signal(df):
-    if df["sma_short"].iloc[-1] > df["sma_long"].iloc[-1]:
+    if df is None or len(df) < 50:
+        return "HOLD"
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+    if latest["sma_short"] > latest["sma_long"] and prev["sma_short"] <= prev["sma_long"]:
         return "BUY"
-    elif df["sma_short"].iloc[-1] < df["sma_long"].iloc[-1]:
+    elif latest["sma_short"] < latest["sma_long"] and prev["sma_short"] >= prev["sma_long"]:
         return "SELL"
     return "HOLD"
 
-def trade(symbol):
-    df = get_latest_data(symbol)
-    signal = get_signal(df)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {symbol}: {signal}")
-    position = None
+def place_trade(symbol, side):
     try:
-        position = trading_client.get_open_position(symbol)
-    except:
-        pass
-
-    if signal == "BUY" and not position:
-        trading_client.submit_order(
-            MarketOrderRequest(symbol=symbol, qty=2, side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
+        position_qty = 1  # fixed position size
+        api.submit_order(
+            symbol=symbol,
+            qty=position_qty,
+            side=side.lower(),
+            type="market",
+            time_in_force="gtc",
         )
-        msg = f"✅ Bought 2 shares of {symbol} at {datetime.now().strftime('%H:%M:%S')}"
-        print(msg)
-        send_email(f"Trade Alert: BUY {symbol}", msg)
-    elif signal == "SELL" and position:
-        trading_client.submit_order(
-            MarketOrderRequest(symbol=symbol, qty=position.qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
-        )
-        msg = f"🟥 Sold {symbol} at {datetime.now().strftime('%H:%M:%S')}"
-        print(msg)
-        send_email(f"Trade Alert: SELL {symbol}", msg)
-    else:
-        print(f"➖ No trade action for {symbol}")
+        print(f"🟩 {side} {symbol} executed successfully")
+    except Exception as e:
+        print(f"Trade failed for {symbol}: {e}")
 
-# --- Main run ---
 def main():
-    now = datetime.now().time()
-    if not (MARKET_OPEN <= now <= MARKET_CLOSE):
-        print("Market closed, skipping run.")
+    run_time = datetime.now(MARKET_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"=== Tradebot run {run_time} ===")
+
+    if not is_market_open():
+        print("Market is closed. Exiting.")
         return
 
-    print(f"\n=== Tradebot run {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
     for symbol in SYMBOLS:
-        try:
-            trade(symbol)
-        except Exception as e:
-            print(f"Error trading {symbol}: {e}")
+        print(f"\nChecking {symbol}...")
+
+        df = get_bars(symbol)
+        signal = get_signal(df)
+
+        print(f"[{datetime.now(MARKET_TZ).strftime('%H:%M:%S')}] {symbol}: Signal = {signal}")
+
+        # Enforce max trades per day
+        if symbol not in trade_log:
+            trade_log[symbol] = {"count": 0, "last_side": None}
+
+        if trade_log[symbol]["count"] >= MAX_TRADES_PER_SYMBOL:
+            print(f"⏸️ Max trades reached for {symbol}")
+            continue
+
+        if signal == "BUY" and trade_log[symbol]["last_side"] != "BUY":
+            place_trade(symbol, "BUY")
+            trade_log[symbol]["count"] += 1
+            trade_log[symbol]["last_side"] = "BUY"
+
+        elif signal == "SELL" and trade_log[symbol]["last_side"] != "SELL":
+            place_trade(symbol, "SELL")
+            trade_log[symbol]["count"] += 1
+            trade_log[symbol]["last_side"] = "SELL"
+
+        else:
+            print(f"➖ No trade action for {symbol}")
 
     print("\n✅ Trade check complete. Exiting cleanly.\n")
 
