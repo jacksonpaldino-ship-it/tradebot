@@ -50,16 +50,16 @@ def get_signal(df):
 def place_trade(symbol, side):
     try:
         position_qty = 1  # fixed position size
-        api.submit_order(
+        order = api.submit_order(
             symbol=symbol,
             qty=position_qty,
             side=side.lower(),
             type="market",
             time_in_force="gtc",
         )
-        print(f"🟩 {side} {symbol} executed successfully")
+        print(f"🟩 Order submitted: {order.side.upper()} {order.qty} {symbol} @ market")
     except Exception as e:
-        print(f"Trade failed for {symbol}: {e}")
+        print(f"❌ Trade failed for {symbol}: {e}")
 
 def main():
     run_time = datetime.now(MARKET_TZ).strftime("%Y-%m-%d %H:%M:%S")
