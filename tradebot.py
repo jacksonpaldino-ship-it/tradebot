@@ -1,117 +1,137 @@
-import os
-import time
-import pandas as pd
 import yfinance as yf
 import alpaca_trade_api as tradeapi
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
+import pandas as pd
+import time
 
-# === CONFIG ===
-API_KEY = os.getenv("ALPACA_API_KEY")
-API_SECRET = os.getenv("ALPACA_SECRET_KEY")
-BASE_URL = "https://paper-api.alpaca.markets"  # use live URL for live trading
-SYMBOLS = ["AAPL", "MSFT", "TSLA", "NVDA", "PLTR", "CRSP"]
-MAX_TRADES_PER_SYMBOL = 2  # limit per day
+# --- Alpaca keys from GitHub Secrets ---
+import os
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+BASE_URL = "https://paper-api.alpaca.markets"
 
-# Market hours
-MARKET_TZ = pytz.timezone("US/Eastern")
-MARKET_OPEN = datetime.now(MARKET_TZ).replace(hour=9, minute=30, second=0, microsecond=0)
-MARKET_CLOSE = datetime.now(MARKET_TZ).replace(hour=16, minute=0, second=0, microsecond=0)
+api = tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, base_url=BASE_URL)
 
-# === INIT ===
-api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version="v2")
-trade_log = {}
-
-def is_market_open():
-    now = datetime.now(MARKET_TZ)
-    return MARKET_OPEN <= now <= MARKET_CLOSE
+# --- Settings ---
+symbols = ["AAPL", "MSFT", "TSLA", "NVDA", "PLTR", "CRSP"]
+COOLDOWN_FILE = "cooldown.csv"  # track daily trade counts
+MAX_TRADES_PER_DAY = 2
+SHORT_MA = 5
+LONG_MA = 20
 
 def get_bars(symbol):
-    try:
-        df = yf.download(symbol, period="60d", interval="15m", progress=False)
-        df["sma_short"] = df["Close"].rolling(window=10).mean()
-        df["sma_long"] = df["Close"].rolling(window=50).mean()
-        return df
-    except Exception as e:
-        print(f"Failed bars for {symbol}: {e}")
-        return None
+    """Fetch 15m bars (max 60 days allowed)"""
+    df = yf.download(symbol, period="60d", interval="15m", progress=False)
+    df.dropna(inplace=True)
+    df["sma_short"] = df["Close"].rolling(SHORT_MA).mean()
+    df["sma_long"] = df["Close"].rolling(LONG_MA).mean()
+    return df
 
 def get_signal(df):
-    try:
-        df["sma_short"] = df["Close"].rolling(window=10).mean()
-        df["sma_long"] = df["Close"].rolling(window=30).mean()
+    """Return BUY / SELL / HOLD based on SMA crossover"""
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
 
-        latest = df.iloc[-1]
-        prev = df.iloc[-2]
+    latest_short = float(latest["sma_short"])
+    latest_long = float(latest["sma_long"])
+    prev_short = float(prev["sma_short"])
+    prev_long = float(prev["sma_long"])
 
-        latest_short = float(latest["sma_short"].iloc[0] if hasattr(latest["sma_short"], "iloc") else latest["sma_short"])
-        latest_long  = float(latest["sma_long"].iloc[0]  if hasattr(latest["sma_long"], "iloc")  else latest["sma_long"])
-        prev_short   = float(prev["sma_short"].iloc[0]   if hasattr(prev["sma_short"], "iloc")   else prev["sma_short"])
-        prev_long    = float(prev["sma_long"].iloc[0]    if hasattr(prev["sma_long"], "iloc")    else prev["sma_long"])
-
-        if latest_short > latest_long and prev_short <= prev_long:
-            return "BUY"
-        elif latest_short < latest_long and prev_short >= prev_long:
-            return "SELL"
-        else:
-            return "HOLD"
-
-    except Exception as e:
-        print(f"Error generating signal: {e}")
+    if prev_short <= prev_long and latest_short > latest_long:
+        return "BUY"
+    elif prev_short >= prev_long and latest_short < latest_long:
+        return "SELL"
+    else:
         return "HOLD"
 
-def place_trade(symbol, side):
+def is_market_open():
+    """Check market hours (9:30–16:00 ET)"""
+    now = datetime.now(pytz.timezone("US/Eastern"))
+    if now.weekday() >= 5:
+        return False
+    open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_time = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    return open_time <= now <= close_time
+
+def load_cooldown():
+    """Track how many times each symbol traded today"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    if not os.path.exists(COOLDOWN_FILE):
+        df = pd.DataFrame(columns=["symbol", "date", "count"])
+    else:
+        df = pd.read_csv(COOLDOWN_FILE)
+    df = df[df["date"] == today]
+    return df
+
+def save_cooldown(df):
+    df.to_csv(COOLDOWN_FILE, index=False)
+
+def increment_cooldown(df, symbol):
+    today = datetime.now().strftime("%Y-%m-%d")
+    if symbol in df["symbol"].values:
+        df.loc[df["symbol"] == symbol, "count"] += 1
+    else:
+        df.loc[len(df)] = [symbol, today, 1]
+    return df
+
+def get_position(symbol):
     try:
-        position_qty = 1  # fixed position size
-        order = api.submit_order(
-            symbol=symbol,
-            qty=position_qty,
-            side=side.lower(),
-            type="market",
-            time_in_force="gtc",
-        )
-        print(f"🟩 Order submitted: {order.side.upper()} {order.qty} {symbol} @ market")
-    except Exception as e:
-        print(f"❌ Trade failed for {symbol}: {e}")
+        pos = api.get_position(symbol)
+        return float(pos.qty)
+    except:
+        return 0.0
+
+def execute_trade(symbol, signal):
+    qty = 1  # adjust as needed
+    if signal == "BUY":
+        print(f"[{symbol}] 🟩 Buying {qty} share(s)")
+        api.submit_order(symbol=symbol, qty=qty, side="buy", type="market", time_in_force="day")
+    elif signal == "SELL":
+        position = get_position(symbol)
+        if position > 0:
+            print(f"[{symbol}] 🟥 Selling {int(position)} share(s)")
+            api.submit_order(symbol=symbol, qty=int(position), side="sell", type="market", time_in_force="day")
 
 def main():
-    run_time = datetime.now(MARKET_TZ).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"=== Tradebot run {run_time} ===")
+    print(f"\n=== Tradebot run {datetime.now()} ===")
 
     if not is_market_open():
-        print("Market is closed. Exiting.")
+        print("⏸️ Market closed — skipping trades.")
         return
 
-    for symbol in SYMBOLS:
+    cooldown_df = load_cooldown()
+
+    for symbol in symbols:
         print(f"\nChecking {symbol}...")
+        try:
+            df = get_bars(symbol)
+            if df.empty or len(df) < LONG_MA:
+                print(f"⚠️ Not enough data for {symbol}")
+                continue
 
-        df = get_bars(symbol)
-        signal = get_signal(df)
+            signal = get_signal(df)
+            print(f"[{symbol}] Signal = {signal}")
 
-        print(f"[{datetime.now(MARKET_TZ).strftime('%H:%M:%S')}] {symbol}: Signal = {signal}")
+            # cooldown
+            trades_today = cooldown_df.loc[cooldown_df["symbol"] == symbol, "count"].sum()
+            if trades_today >= MAX_TRADES_PER_DAY:
+                print(f"🕒 Skipping {symbol}: reached {MAX_TRADES_PER_DAY} trades today.")
+                continue
 
-        # Enforce max trades per day
-        if symbol not in trade_log:
-            trade_log[symbol] = {"count": 0, "last_side": None}
+            if signal in ["BUY", "SELL"]:
+                execute_trade(symbol, signal)
+                cooldown_df = increment_cooldown(cooldown_df, symbol)
+                save_cooldown(cooldown_df)
+            else:
+                print(f"➖ No trade action for {symbol}")
 
-        if trade_log[symbol]["count"] >= MAX_TRADES_PER_SYMBOL:
-            print(f"⏸️ Max trades reached for {symbol}")
-            continue
+            time.sleep(2)
 
-        if signal == "BUY" and trade_log[symbol]["last_side"] != "BUY":
-            place_trade(symbol, "BUY")
-            trade_log[symbol]["count"] += 1
-            trade_log[symbol]["last_side"] = "BUY"
+        except Exception as e:
+            print(f"❌ Error for {symbol}: {e}")
 
-        elif signal == "SELL" and trade_log[symbol]["last_side"] != "SELL":
-            place_trade(symbol, "SELL")
-            trade_log[symbol]["count"] += 1
-            trade_log[symbol]["last_side"] = "SELL"
-
-        else:
-            print(f"➖ No trade action for {symbol}")
-
-    print("\n✅ Trade check complete. Exiting cleanly.\n")
+    print("\n✅ Trade check complete. Exiting cleanly.")
 
 if __name__ == "__main__":
     main()
