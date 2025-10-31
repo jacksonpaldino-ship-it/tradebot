@@ -1,0 +1,29 @@
+name: Run P&L Tracker
+
+on:
+  schedule:
+    # Runs once every weekday at 4:15 PM ET (15 min after market close)
+    - cron: "15 21 * * 1-5"
+  workflow_dispatch:  # lets you run it manually from the Actions tab
+
+jobs:
+  pnl-tracker:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install alpaca-trade-api colorama
+
+      - name: Run P&L Tracker
+        env:
+          APCA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY }}
+          APCA_API_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: python pnl_tracker.py
