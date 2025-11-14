@@ -1,34 +1,30 @@
-name: Run Tradebot at Market Open
+name: Daily Trade Bot
 
 on:
   schedule:
-    # Run every weekday at 9:35 AM Eastern Time (14:35 UTC)
-    - cron: '35 14 * * 1-5'
-  workflow_dispatch:  # allows manual runs too
+    - cron: "*/15 13-20 * * 1-5"
+  workflow_dispatch:
 
 jobs:
-  run-bot:
+  tradebot:
     runs-on: ubuntu-latest
-    env:
-      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
-      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-      TZ: America/New_York
-      PYTHONUNBUFFERED: 1
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    - name: Checkout
+      uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install yfinance alpaca-trade-api pandas numpy pytz
+    - name: Install deps
+      run: |
+        pip install --upgrade pip
+        pip install alpaca-py yfinance pandas numpy pytz
 
-      - name: Run tradebot
-        run: |
-          python tradebot.py
-
+    - name: Run bot
+      env:
+        ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+        ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      run: python tradebot.py
