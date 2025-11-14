@@ -129,25 +129,33 @@ def main():
     est = now_est()
     print(f"Time: {est}")
 
-    # 1. At market open — choose stock
-    if est.hour == 9 and est.minute <= 35:
-        print("📈 Market open — scanning for best stock...")
+    positions = client.get_all_positions()
+    has_position = len(positions) > 0
 
-        ticker = pick_best_stock()
+    # 1. If no position AND before sell time → buy something
+    if not has_position:
+        if est.strftime("%H:%M") < CLOSE_TIME:
+            print("📈 No open positions — scanning for best stock to BUY...")
 
-        if ticker:
-            print(f"🔥 Best pick today: {ticker}")
-            buy_ticker(ticker)
+            ticker = pick_best_stock()
+
+            if ticker:
+                print(f"🔥 Best pick today: {ticker}")
+                buy_ticker(ticker)
+            else:
+                print("⚠ No strong stock today")
         else:
-            print("⚠ No strong stock today")
+            print("⏳ Too close to market close — will not open new positions")
 
-    # 2. Before close — exit all trades
-    if est.strftime("%H:%M") == CLOSE_TIME:
-        print("🕒 Selling all positions before close...")
-        close_all_positions()
+    # 2. If we DO have a position and it's close to market close → sell everything
+    else:
+        print("📦 Currently holding a position")
+
+        if est.strftime("%H:%M") >= CLOSE_TIME:
+            print("🕒 Time to SELL before close...")
+            close_all_positions()
+        else:
+            print("📘 Holding until near close")
 
     print("Done.\n")
 
-
-if __name__ == "__main__":
-    main()
