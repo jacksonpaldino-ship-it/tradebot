@@ -131,7 +131,7 @@ def main():
 
     positions = client.get_all_positions()
     has_position = len(positions) > 0
-
+    
     # 1. If no position AND before sell time → buy something
     if not has_position:
         if est.strftime("%H:%M") < CLOSE_TIME:
