@@ -31,7 +31,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.trading.requests import MarketOrderRequest
 
 # ---------------- CONFIG ----------------
-DRY_RUN = True                 # True => don't submit real orders
+DRY_RUN = False                # True => don't submit real orders
 PAPER = True                   # TradingClient(..., paper=True)
 SYMBOL = "SPY"
 
