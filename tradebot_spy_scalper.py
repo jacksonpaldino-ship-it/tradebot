@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
-tradebot_spy_scalper.py
-Full replacement script — SPY multi-entry intraday scalper with broker-side bracket orders,
-built for alpaca-py (new SDK). DRY_RUN=True by default.
+tradebot_spy_improved.py
+
+Medium-frequency SPY day-trader (Option A):
+- Opening-range breakout (9:30-9:45 ET)
+- VWAP pullback entries
+- 9-EMA pullback entries (trend-follow)
+- Broker-side bracket orders (TP & SL) via alpaca-py OrderRequest
+- ATR-based sizing & stops
+- Cooldowns, daily entry cap, DRY_RUN default
+- Logs trades to CSV and persists state to JSON
 """
 
 import os
@@ -17,56 +24,56 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-# Alpaca-py imports
+# Alpaca-py
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass
 from alpaca.trading.requests import OrderRequest
 
-# ---------------- CONFIG ----------------
-DRY_RUN = False                 # True => only print & log; False => actually submit to Alpaca
-PAPER = True                   # use paper environment for TradingClient
+# ------------------ CONFIG ------------------
+DRY_RUN = False                 # set False to submit real orders
+PAPER = True                   # use paper account in TradingClient(...)
 SYMBOL = "SPY"
 
 # Opening range window
 OPEN_START = dtime(9, 30)
-OPEN_END   = dtime(9, 45)     # 15-minute opening range
+OPEN_END   = dtime(9, 45)      # 15-minute opening range
 
-# Trading hours guard (Eastern)
+# Trading day parameters
 ET = pytz.timezone("US/Eastern")
-CLOSE_TIME = dtime(15, 55)    # close before 15:55 ET
+CLOSE_TIME = dtime(15, 55)     # close before 3:55 PM ET
 
 # Risk & sizing
-EQUITY_RISK_PCT = 0.005       # 0.5% of equity risk per trade
-MAX_ALLOC_PCT = 0.30          # cap allocation per trade
-MAX_TOTAL_EXPOSURE_PCT = 0.90
+EQUITY_RISK_PCT = 0.004        # risk per trade = 0.4% of equity
+MAX_ALLOC_PCT = 0.25           # cap allocation per trade (25% of equity)
+MAX_TOTAL_EXPOSURE_PCT = 0.9
 
-# ATR stop sizing
+# ATR stops
 ATR_PERIOD = 14
-MIN_STOP_PCT = 0.0015         # 0.15% min stop
-MAX_STOP_PCT = 0.05           # 5% max stop
-TP_MULTIPLIER = 2.0
+MIN_STOP_PCT = 0.0015          # 0.15%
+MAX_STOP_PCT = 0.06            # 6%
+TP_MULT = 2.0
 
-# Re-entry controls
-REENTRY_COOLDOWN_MIN = 20     # minutes
-MAX_ENTRIES_PER_DAY = 8
+# Entries & cooldown
+REENTRY_COOLDOWN_MIN = 25
+MAX_ENTRIES_PER_DAY = 6
 
 # Files
-STATE_FILE = "scalper_state.json"
-LOG_FILE = "scalper_trades.csv"
+STATE_FILE = "improved_state.json"
+LOG_FILE = "improved_trades.csv"
 
-# yfinance 1m limit
+# YFinance lookback (1m data limited ~7 days)
 YF_LOOKBACK_DAYS = 7
 
-# Alpaca credentials (set via env / GitHub Secrets)
+# Alpaca credentials (env / GitHub Secrets)
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 
-# ---------------- Alpaca client ----------------
+# ------------------ CLIENT ------------------
 if ALPACA_API_KEY is None or ALPACA_SECRET_KEY is None:
-    print("ALPACA_API_KEY or ALPACA_SECRET_KEY not set — script runs in DRY_RUN-only mode.")
-trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER)
+    print("Warning: Alpaca keys not found in env — DRY_RUN-only mode.")
+client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER)
 
-# ---------------- Utilities ----------------
+# ------------------ UTIL ------------------
 def now_et():
     return datetime.now(ET)
 
@@ -75,11 +82,11 @@ def load_state():
         try:
             with open(STATE_FILE, "r") as f:
                 return json.load(f)
-        except Exception:
+        except:
             pass
     return {
         "date": date.today().isoformat(),
-        "opening_range": None,   # {"high":float,"low":float,"formed_at":str}
+        "opening_range": None,
         "entries_today": 0,
         "last_entry_ts": None,
         "entries": []
@@ -92,33 +99,27 @@ def save_state(s):
 def reset_if_new_day(state):
     today = date.today().isoformat()
     if state.get("date") != today:
-        return {
-            "date": today,
-            "opening_range": None,
-            "entries_today": 0,
-            "last_entry_ts": None,
-            "entries": []
-        }
+        return {"date": today, "opening_range": None, "entries_today": 0, "last_entry_ts": None, "entries": []}
     return state
 
 def append_log(row):
-    fieldnames = ["timestamp","date","symbol","side","mode","qty","entry_price","stop_price","tp_price","order_id","dry_run"]
-    newfile = not os.path.exists(LOG_FILE)
+    fields = ["timestamp","date","symbol","side","mode","qty","entry_price","stop_price","tp_price","order_id","dry_run"]
+    newf = not os.path.exists(LOG_FILE)
     with open(LOG_FILE, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if newfile:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        if newf:
             writer.writeheader()
-        writer.writerow({k: row.get(k,"") for k in fieldnames})
+        writer.writerow({k: row.get(k,"") for k in fields})
 
-# ---------------- Data helpers ----------------
+# ------------------ DATA HELPERS ------------------
 def fetch_1m(symbol, days=YF_LOOKBACK_DAYS):
     df = yf.download(symbol, period=f"{days}d", interval="1m", progress=False)
     if df.empty:
         return df
     if isinstance(df.index, pd.MultiIndex):
         df = df.droplevel(0)
+    # localize/convert to ET
     try:
-        # if naive index, localize to UTC then convert to ET
         if df.index.tz is None:
             df.index = df.index.tz_localize("UTC").tz_convert(ET)
         else:
@@ -127,33 +128,42 @@ def fetch_1m(symbol, days=YF_LOOKBACK_DAYS):
         pass
     return df
 
+def vwap(df):
+    # df expected to have 'Close' and 'Volume' with datetime index intraday
+    typical = (df['High'] + df['Low'] + df['Close']) / 3
+    pv = typical * df['Volume']
+    return pv.cumsum() / df['Volume'].cumsum()
+
+def ema(series, n):
+    return series.ewm(span=n, adjust=False).mean()
+
+def rsi(series, n=14):
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    ma_up = up.ewm(alpha=1/n, min_periods=n).mean()
+    ma_down = down.ewm(alpha=1/n, min_periods=n).mean()
+    rs = ma_up / ma_down
+    return 100 - (100 / (1 + rs))
+
 def compute_atr(df, n=ATR_PERIOD):
-    high_low = df["High"] - df["Low"]
-    high_close = (df["High"] - df["Close"].shift()).abs()
-    low_close = (df["Low"] - df["Close"].shift()).abs()
+    high_low = df['High'] - df['Low']
+    high_close = (df['High'] - df['Close'].shift()).abs()
+    low_close = (df['Low'] - df['Close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr = tr.rolling(n).mean()
-    return atr
+    return tr.rolling(n).mean()
 
 def get_account_equity():
     try:
-        acct = trading_client.get_account()
+        acct = client.get_account()
         return float(acct.equity)
     except Exception as e:
-        # fallback mock
-        print("Warning: couldn't fetch account equity:", e)
+        print("Couldn't fetch account equity:", e)
         return 100000.0
-
-def total_open_exposure():
-    try:
-        pos = trading_client.get_all_positions()
-        return sum(float(p.market_value) for p in pos)
-    except Exception:
-        return 0.0
 
 def get_position_qty(symbol):
     try:
-        pos = trading_client.get_all_positions()
+        pos = client.get_all_positions()
         for p in pos:
             if p.symbol == symbol:
                 return int(float(p.qty))
@@ -161,84 +171,65 @@ def get_position_qty(symbol):
     except Exception:
         return 0
 
-# ---------------- Bracket order helpers (OrderRequest) ----------------
-def submit_bracket_long(symbol, qty, stop_price, tp_price):
+# ------------------ ORDER HELPERS (bracket) ------------------
+def submit_bracket(symbol, qty, side, stop_price, tp_price):
     if qty <= 0:
-        print("qty <= 0; skipping buy")
+        print("Qty 0 — skipping order.")
         return None
     if DRY_RUN or ALPACA_API_KEY is None:
-        print(f"[DRY_RUN] BRACKET LONG: {symbol} qty={qty} stop={stop_price} tp={tp_price}")
-        return {"id":"dryrun_long","symbol":symbol,"qty":qty}
+        print(f"[DRY_RUN] SUBMIT {side} {symbol} qty={qty} stop={stop_price} tp={tp_price}")
+        return {"id": f"dry_{side}", "symbol": symbol, "qty": qty}
     try:
         order = OrderRequest(
             symbol=symbol,
             qty=qty,
-            side=OrderSide.BUY,
+            side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
             type=OrderType.MARKET,
             time_in_force=TimeInForce.DAY,
             order_class=OrderClass.BRACKET,
             take_profit={"limit_price": f"{tp_price:.2f}"},
             stop_loss={"stop_price": f"{stop_price:.2f}"}
         )
-        resp = trading_client.submit_order(order)
-        print("Submitted bracket long id:", getattr(resp, "id", "unknown"))
+        resp = client.submit_order(order)
+        print("Submitted bracket order id:", getattr(resp, "id", "unknown"))
         return resp
     except Exception as e:
-        print("Error submitting bracket long:", e)
+        print("Error submitting bracket:", e)
         return None
 
-def submit_bracket_short(symbol, qty, stop_price, tp_price):
-    if qty <= 0:
-        print("qty <= 0; skipping short")
-        return None
-    if DRY_RUN or ALPACA_API_KEY is None:
-        print(f"[DRY_RUN] BRACKET SHORT: {symbol} qty={qty} stop={stop_price} tp={tp_price}")
-        return {"id":"dryrun_short","symbol":symbol,"qty":qty}
-    try:
-        order = OrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=OrderSide.SELL,
-            type=OrderType.MARKET,
-            time_in_force=TimeInForce.DAY,
-            order_class=OrderClass.BRACKET,
-            take_profit={"limit_price": f"{tp_price:.2f}"},
-            stop_loss={"stop_price": f"{stop_price:.2f}"}
-        )
-        resp = trading_client.submit_order(order)
-        print("Submitted bracket short id:", getattr(resp, "id", "unknown"))
-        return resp
-    except Exception as e:
-        print("Error submitting bracket short:", e)
-        return None
+# ------------------ STRATEGY LOGIC ------------------
 
-# ---------------- Core strategy logic ----------------
+# Entry rules (priority order)
+# 1) OR breakout/breakdown (fast)
+# 2) VWAP pullback (price > VWAP, pulls to VWAP, momentum supports)
+# 3) EMA9 pullback in trend (price returns to EMA9 while 1m trend above/below)
+
 def form_opening_range(state):
     if state.get("opening_range"):
         return state
     df = fetch_1m(SYMBOL)
     if df.empty:
-        print("No 1m bars yet.")
+        print("No 1m bars")
         return state
     today = date.today()
     todays = df[df.index.date == today]
     if todays.empty:
-        print("No intraday bars for today.")
+        print("No intraday bars for today")
         return state
     mask = (todays.index.time >= OPEN_START) & (todays.index.time < OPEN_END)
     or_bars = todays.loc[mask]
     if or_bars.empty:
-        print("Opening range not formed yet.")
+        print("Opening range not complete yet")
         return state
-    high = float(or_bars["High"].max())
-    low  = float(or_bars["Low"].min())
-    state["opening_range"] = {"high": high, "low": low, "formed_at": or_bars.index[0].isoformat()}
-    print(f"Opening range formed: high={high:.4f}, low={low:.4f}")
+    high = float(or_bars['High'].max())
+    low = float(or_bars['Low'].min())
+    state['opening_range'] = {"high": high, "low": low, "formed_at": or_bars.index[0].isoformat()}
+    print(f"OR formed: high={high:.4f}, low={low:.4f}")
     save_state(state)
     return state
 
 def compute_qty_stop(price, atr, equity, side="long"):
-    # determine stop distance
+    # Determine stop distance
     if atr and not np.isnan(atr) and atr > 0:
         stop_dist = max(atr, price * MIN_STOP_PCT)
     else:
@@ -254,89 +245,197 @@ def compute_qty_stop(price, atr, equity, side="long"):
         return 0, stop_dist, stop_dist
     if side == "long":
         stop_price = round(price - stop_dist, 4)
-        tp_price = round(price + stop_dist * TP_MULTIPLIER, 4)
+        tp_price = round(price + stop_dist * TP_MULT, 4)
     else:
         stop_price = round(price + stop_dist, 4)
-        tp_price = round(price - stop_dist * TP_MULTIPLIER, 4)
+        tp_price = round(price - stop_dist * TP_MULT, 4)
     return qty, stop_price, tp_price
 
-def attempt_entries(state):
-    if not state.get("opening_range"):
-        print("OR not formed; skipping entries.")
+def should_enter_or_breakout(state, df_latest_row):
+    # check OR breakout/breakdown
+    or_high = state['opening_range']['high']
+    or_low  = state['opening_range']['low']
+    price = float(df_latest_row['Close'])
+    buf = 0.0006
+    if price > or_high * (1 + buf):
+        return "long_or"
+    if price < or_low * (1 - buf):
+        return "short_or"
+    return None
+
+def should_enter_vwap(df):
+    # vwap on intraday df
+    v = vwap(df)
+    last = v.iloc[-1]
+    price = df['Close'].iloc[-1]
+    prev_price = df['Close'].iloc[-2] if len(df) > 1 else price
+    # long case: price > vwap, then pullback close to vwap and bounce with RSI not overbought
+    if price > last:
+        # price above vwap now; check prior pullback: if prev_price < last and now price > prev -> bounce
+        if prev_price < last and price > prev_price:
+            r = rsi(df['Close']).iloc[-1]
+            if r < 70:
+                return "long_vwap"
+    # short case: price < vwap and bounce down from vwap
+    if price < last:
+        if prev_price > last and price < prev_price:
+            r = rsi(df['Close']).iloc[-1]
+            if r > 30:
+                return "short_vwap"
+    return None
+
+def should_enter_ema_pull(df):
+    # 9-EMA pullback in direction of short-term trend
+    ema9 = ema(df['Close'], 9)
+    ema21 = ema(df['Close'], 21)
+    price = df['Close'].iloc[-1]
+    prev = df['Close'].iloc[-2] if len(df) > 1 else price
+    # long condition: 9>21 (uptrend) and price pulls to ema9 and bounces
+    if ema9.iloc[-1] > ema21.iloc[-1]:
+        # pull to ema9 then bounce: prev < ema9 and price > prev
+        if prev < ema9.iloc[-1] and price > prev:
+            r = rsi(df['Close']).iloc[-1]
+            if r < 70:
+                return "long_ema"
+    # short condition
+    if ema9.iloc[-1] < ema21.iloc[-1]:
+        if prev > ema9.iloc[-1] and price < prev:
+            r = rsi(df['Close']).iloc[-1]
+            if r > 30:
+                return "short_ema"
+    return None
+
+def attempt_entry(state):
+    # must have OR formed
+    if not state.get('opening_range'):
+        print("No OR -> skip entries")
         return state
-    if state.get("entries_today", 0) >= MAX_ENTRIES_PER_DAY:
-        print("Max entries reached for today.")
+    if state.get('entries_today', 0) >= MAX_ENTRIES_PER_DAY:
+        print("Max entries today reached")
         return state
-    last_ts = state.get("last_entry_ts")
+    last_ts = state.get('last_entry_ts')
     if last_ts:
         last = datetime.fromisoformat(last_ts)
         if (now_et() - last) < timedelta(minutes=REENTRY_COOLDOWN_MIN):
-            print("In cooldown; skipping entry.")
+            print("Cooldown active -> skip entry")
             return state
 
     df = fetch_1m(SYMBOL)
     if df.empty:
         return state
-    todays = df[df.index.date == date.today()]
-    if todays.empty:
+    today_df = df[df.index.date == date.today()]
+    if today_df.empty:
         return state
-    latest = todays.iloc[-1]
-    price = float(latest["Close"])
-
-    OR_high = state["opening_range"]["high"]
-    OR_low  = state["opening_range"]["low"]
-    buffer = 0.0006  # 0.06%
+    latest = today_df.iloc[-1]
+    price = float(latest['Close'])
 
     equity = get_account_equity()
     atr_series = compute_atr(df)
     atr = float(atr_series.dropna().iloc[-1]) if not atr_series.dropna().empty else None
 
-    # LONG breakout
-    if price > OR_high * (1 + buffer):
-        if get_position_qty(SYMBOL) > 0:
-            print("Already long; skip.")
-            return state
-        qty, stop_price, tp_price = compute_qty_stop(price, atr, equity, "long")
-        if qty <= 0:
-            print("Qty 0 for long; skip.")
-            return state
-        resp = submit_bracket_long(SYMBOL, qty, stop_price, tp_price)
-        order_id = getattr(resp, "id", (resp or {}).get("id", ""))
-        log = {"timestamp": now_et().isoformat(), "date": date.today().isoformat(),
-               "symbol": SYMBOL, "side": "LONG", "mode": "BREAKOUT",
-               "qty": qty, "entry_price": price, "stop_price": stop_price, "tp_price": tp_price,
-               "order_id": order_id, "dry_run": DRY_RUN or (ALPACA_API_KEY is None)}
-        append_log(log)
-        state["last_entry_ts"] = now_et().isoformat()
-        state["entries_today"] = state.get("entries_today", 0) + 1
-        state.setdefault("entries", []).append(log)
-        save_state(state)
-        return state
+    # Priority 1: OR breakout
+    or_signal = should_enter_or_breakout(state, latest)
+    if or_signal:
+        if or_signal == "long_or" and get_position_qty(SYMBOL) <= 0:
+            qty, stop, tp = compute_qty_stop(price, atr, equity, "long")
+            if qty > 0:
+                resp = submit_bracket(SYMBOL, qty, "buy", stop, tp)
+                order_id = getattr(resp,"id",(resp or {}).get("id",""))
+                log = {"timestamp": now_et().isoformat(), "date": date.today().isoformat(),
+                       "symbol": SYMBOL, "side": "LONG", "mode": "OR_BREAKOUT",
+                       "qty": qty, "entry_price": price, "stop_price": stop, "tp_price": tp,
+                       "order_id": order_id, "dry_run": DRY_RUN or (ALPACA_API_KEY is None)}
+                append_log(log)
+                state['last_entry_ts'] = now_et().isoformat()
+                state['entries_today'] = state.get('entries_today',0)+1
+                state.setdefault('entries',[]).append(log)
+                save_state(state)
+                return state
+        if or_signal == "short_or" and get_position_qty(SYMBOL) >= 0:
+            qty, stop, tp = compute_qty_stop(price, atr, equity, "short")
+            if qty > 0:
+                resp = submit_bracket(SYMBOL, qty, "sell", stop, tp)
+                order_id = getattr(resp,"id",(resp or {}).get("id",""))
+                log = {"timestamp": now_et().isoformat(), "date": date.today().isoformat(),
+                       "symbol": SYMBOL, "side": "SHORT", "mode": "OR_BREAKDOWN",
+                       "qty": qty, "entry_price": price, "stop_price": stop, "tp_price": tp,
+                       "order_id": order_id, "dry_run": DRY_RUN or (ALPACA_API_KEY is None)}
+                append_log(log)
+                state['last_entry_ts'] = now_et().isoformat()
+                state['entries_today'] = state.get('entries_today',0)+1
+                state.setdefault('entries',[]).append(log)
+                save_state(state)
+                return state
 
-    # SHORT breakdown
-    if price < OR_low * (1 - buffer):
-        pos_qty = get_position_qty(SYMBOL)
-        if pos_qty < 0:
-            print("Already short; skip.")
-            return state
-        qty, stop_price, tp_price = compute_qty_stop(price, atr, equity, "short")
-        if qty <= 0:
-            print("Qty 0 for short; skip.")
-            return state
-        resp = submit_bracket_short(SYMBOL, qty, stop_price, tp_price)
-        order_id = getattr(resp, "id", (resp or {}).get("id", ""))
-        log = {"timestamp": now_et().isoformat(), "date": date.today().isoformat(),
-               "symbol": SYMBOL, "side": "SHORT", "mode": "BREAKDOWN",
-               "qty": qty, "entry_price": price, "stop_price": stop_price, "tp_price": tp_price,
-               "order_id": order_id, "dry_run": DRY_RUN or (ALPACA_API_KEY is None)}
-        append_log(log)
-        state["last_entry_ts"] = now_et().isoformat()
-        state["entries_today"] = state.get("entries_today", 0) + 1
-        state.setdefault("entries", []).append(log)
-        save_state(state)
-        return state
+    # Priority 2: VWAP pullbacks
+    vwap_signal = should_enter_vwap(today_df)
+    if vwap_signal:
+        if vwap_signal == "long_vwap" and get_position_qty(SYMBOL) <= 0:
+            qty, stop, tp = compute_qty_stop(price, atr, equity, "long")
+            if qty > 0:
+                resp = submit_bracket(SYMBOL, qty, "buy", stop, tp)
+                order_id = getattr(resp,"id",(resp or {}).get("id",""))
+                log = {"timestamp": now_et().isoformat(), "date": date.today().isoformat(),
+                       "symbol": SYMBOL, "side": "LONG", "mode": "VWAP_PULL",
+                       "qty": qty, "entry_price": price, "stop_price": stop, "tp_price": tp,
+                       "order_id": order_id, "dry_run": DRY_RUN or (ALPACA_API_KEY is None)}
+                append_log(log)
+                state['last_entry_ts'] = now_et().isoformat()
+                state['entries_today'] = state.get('entries_today',0)+1
+                state.setdefault('entries',[]).append(log)
+                save_state(state)
+                return state
+        if vwap_signal == "short_vwap" and get_position_qty(SYMBOL) >= 0:
+            qty, stop, tp = compute_qty_stop(price, atr, equity, "short")
+            if qty > 0:
+                resp = submit_bracket(SYMBOL, qty, "sell", stop, tp)
+                order_id = getattr(resp,"id",(resp or {}).get("id",""))
+                log = {"timestamp": now_et().isoformat(), "date": date.today().isoformat(),
+                       "symbol": SYMBOL, "side": "SHORT", "mode": "VWAP_PULL",
+                       "qty": qty, "entry_price": price, "stop_price": stop, "tp_price": tp,
+                       "order_id": order_id, "dry_run": DRY_RUN or (ALPACA_API_KEY is None)}
+                append_log(log)
+                state['last_entry_ts'] = now_et().isoformat()
+                state['entries_today'] = state.get('entries_today',0)+1
+                state.setdefault('entries',[]).append(log)
+                save_state(state)
+                return state
 
-    print(f"No breakout/breakdown — price={price:.4f} OR_high={OR_high:.4f} OR_low={OR_low:.4f}")
+    # Priority 3: EMA9 pullback entries
+    ema_signal = should_enter_ema_pull(today_df)
+    if ema_signal:
+        if ema_signal == "long_ema" and get_position_qty(SYMBOL) <= 0:
+            qty, stop, tp = compute_qty_stop(price, atr, equity, "long")
+            if qty > 0:
+                resp = submit_bracket(SYMBOL, qty, "buy", stop, tp)
+                order_id = getattr(resp,"id",(resp or {}).get("id",""))
+                log = {"timestamp": now_et().isoformat(), "date": date.today().isoformat(),
+                       "symbol": SYMBOL, "side": "LONG", "mode": "EMA_PULL",
+                       "qty": qty, "entry_price": price, "stop_price": stop, "tp_price": tp,
+                       "order_id": order_id, "dry_run": DRY_RUN or (ALPACA_API_KEY is None)}
+                append_log(log)
+                state['last_entry_ts'] = now_et().isoformat()
+                state['entries_today'] = state.get('entries_today',0)+1
+                state.setdefault('entries',[]).append(log)
+                save_state(state)
+                return state
+        if ema_signal == "short_ema" and get_position_qty(SYMBOL) >= 0:
+            qty, stop, tp = compute_qty_stop(price, atr, equity, "short")
+            if qty > 0:
+                resp = submit_bracket(SYMBOL, qty, "sell", stop, tp)
+                order_id = getattr(resp,"id",(resp or {}).get("id",""))
+                log = {"timestamp": now_et().isoformat(), "date": date.today().isoformat(),
+                       "symbol": SYMBOL, "side": "SHORT", "mode": "EMA_PULL",
+                       "qty": qty, "entry_price": price, "stop_price": stop, "tp_price": tp,
+                       "order_id": order_id, "dry_run": DRY_RUN or (ALPACA_API_KEY is None)}
+                append_log(log)
+                state['last_entry_ts'] = now_et().isoformat()
+                state['entries_today'] = state.get('entries_today',0)+1
+                state.setdefault('entries',[]).append(log)
+                save_state(state)
+                return state
+
+    print("No entry conditions met this run.")
     return state
 
 def close_all_before_close():
@@ -345,45 +444,42 @@ def close_all_before_close():
         return
     pos_qty = get_position_qty(SYMBOL)
     if pos_qty == 0:
-        print("No positions to close at EOD.")
+        print("No positions to close.")
         return
+    # close with market order via OrderRequest
     if DRY_RUN or ALPACA_API_KEY is None:
-        print(f"[DRY_RUN] Closing position qty={pos_qty} for {SYMBOL}")
+        print(f"[DRY_RUN] Closing {pos_qty} of {SYMBOL}")
         append_log({"timestamp": now_et().isoformat(), "date": date.today().isoformat(),
-                    "symbol": SYMBOL, "side": "CLOSE", "mode": "EOD_CLOSE",
-                    "qty": pos_qty, "entry_price": "", "stop_price": "", "tp_price": "",
-                    "order_id": "dryrun_close", "dry_run": True})
+                    "symbol": SYMBOL, "side": "CLOSE", "mode": "EOD", "qty": pos_qty, "entry_price": "", "stop_price": "", "tp_price": "", "order_id": "dry_close", "dry_run": True})
         return
     try:
         if pos_qty > 0:
-            order = OrderRequest(symbol=SYMBOL, qty=pos_qty, side=OrderSide.SELL, type=OrderType.MARKET, time_in_force=TimeInForce.DAY)
+            req = OrderRequest(symbol=SYMBOL, qty=pos_qty, side=OrderSide.SELL, type=OrderType.MARKET, time_in_force=TimeInForce.DAY)
         else:
-            order = OrderRequest(symbol=SYMBOL, qty=abs(pos_qty), side=OrderSide.BUY, type=OrderType.MARKET, time_in_force=TimeInForce.DAY)
-        resp = trading_client.submit_order(order)
-        print("Submitted EOD close order id:", getattr(resp, "id", ""))
+            req = OrderRequest(symbol=SYMBOL, qty=abs(pos_qty), side=OrderSide.BUY, type=OrderType.MARKET, time_in_force=TimeInForce.DAY)
+        resp = client.submit_order(req)
         append_log({"timestamp": now_et().isoformat(), "date": date.today().isoformat(),
-                    "symbol": SYMBOL, "side": "CLOSE", "mode": "EOD_CLOSE",
-                    "qty": pos_qty, "entry_price": "", "stop_price": "", "tp_price": "",
-                    "order_id": getattr(resp,"id",""), "dry_run": False})
+                    "symbol": SYMBOL, "side": "CLOSE", "mode": "EOD", "qty": pos_qty, "order_id": getattr(resp,"id",""), "dry_run": False})
+        print("EOD close submitted:", getattr(resp,"id",""))
     except Exception as e:
-        print("Error closing positions at EOD:", e)
+        print("Error closing positions:", e)
 
-# ---------------- Main ----------------
+# ------------------ MAIN RUN ------------------
 def run_once():
     state = load_state()
     state = reset_if_new_day(state)
 
-    # form opening range once available
+    # form OR first
     state = form_opening_range(state)
 
-    # attempt entries if before close
+    # only trade during market hours (until close_time)
     if now_et().time() < CLOSE_TIME:
-        state = attempt_entries(state)
+        state = attempt_entry(state)
     else:
         close_all_before_close()
 
     save_state(state)
-    print("Run complete.")
+    print("Run done.")
 
 if __name__ == "__main__":
     run_once()
