@@ -19,7 +19,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass
 from alpaca.trading.requests import OrderRequest
 
 # ---------------- CONFIG ----------------
-DRY_RUN = True
+DRY_RUN = False
 PAPER = True
 SYMBOL = "SPY"
 
