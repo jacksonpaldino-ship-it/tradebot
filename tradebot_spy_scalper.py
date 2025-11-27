@@ -36,7 +36,7 @@ except Exception:
     ALPACA_PY_AVAILABLE = False
 
 # ---------------- CONFIG ----------------
-DRY_RUN = True                 # Set False to submit orders (ONLY after testing)
+DRY_RUN = False                 # Set False to submit orders (ONLY after testing)
 PAPER = True                   # Alpaca paper account
 SYMBOL = "SPY"
 
