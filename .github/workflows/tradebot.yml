@@ -22,10 +22,21 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install alpaca-py yfinance pandas numpy pytz
+          pip install alpaca-py yfinance pandas numpy pytz requests
 
-      - name: Run trade bot
+      - name: Run bot
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-        run: python tradebot_spy_scalper.py
+          SIGNAL_SHEET_CSV_URL: ${{ secrets.SIGNAL_SHEET_CSV_URL }}
+        run: python hybrid_tradebot_spy_signals.py
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-artifacts
+          path: |
+            trades.csv
+            trade_stats.json
+            bot.log
