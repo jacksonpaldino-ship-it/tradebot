@@ -2,7 +2,7 @@ name: Daily Trade Bot
 
 on:
   schedule:
-    # Runs every 5 minutes during market hours (9:30–16:00 ET -> 13:30–21:00 UTC).
+    # Every 5 minutes during US market hours (13:30–21:00 UTC)
     - cron: "*/5 13-21 * * 1-5"
   workflow_dispatch: {}
 
@@ -29,14 +29,5 @@ jobs:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           SIGNAL_SHEET_CSV_URL: ${{ secrets.SIGNAL_SHEET_CSV_URL }}
+          MONITOR_TIMEOUT_OVERRIDE: "60"  # <= optional (1 min while testing)
         run: python hybrid_tradebot_spy_signals.py
-
-      - name: Upload artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: trade-artifacts
-          path: |
-            trades.csv
-            trade_stats.json
-            bot.log
