@@ -1,133 +1,140 @@
 import os
+import json
+import requests
 from datetime import datetime, timedelta
-import pandas as pd
-import numpy as np
-from alpaca_trade_api.rest import REST, TimeFrame
+from alpaca_trade_api import REST
 
-# ==========================
-# Alpaca API credentials
-# ==========================
-API_KEY = os.getenv("ALPACA_API_KEY")
-API_SECRET = os.getenv("ALPACA_SECRET_KEY")
-BASE_URL = os.getenv("ALPACA_BASE_URL")
-
-if not all([API_KEY, API_SECRET, BASE_URL]):
-    raise ValueError("API credentials missing. Set ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL")
+# -----------------------------------------
+# CONFIG
+# -----------------------------------------
+API_KEY = os.getenv("APCA_API_KEY_ID")
+API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+BASE_URL = "https://paper-api.alpaca.markets"   # Change if live trading
 
 api = REST(API_KEY, API_SECRET, BASE_URL)
 
-# ==========================
-# Trading configuration
-# ==========================
-SYMBOLS = ["SPY", "QQQ", "IWM", "DIA"]
-TRADE_QTY = 1  # modify for your account
-MAX_PRICE_VWAP_DISTANCE = 0.5  # % of spread
-MIN_VOL_THRESHOLD = 1e5  # minimum volume for trade
-GUARANTEE_TRADE = True  # force at least one trade per day
+TICKERS = ["SPY", "QQQ", "IWM", "DIA"]
+LAST_TRADE_FILE = "last_trade.json"
 
-# ==========================
-# Fetch recent bars
-# ==========================
-def fetch_data(symbol, limit=50):
+
+# -----------------------------------------
+# Load & Save Persistent Data
+# -----------------------------------------
+def load_last_trade():
+    if not os.path.exists(LAST_TRADE_FILE):
+        return {}
+    with open(LAST_TRADE_FILE, "r") as f:
+        return json.load(f)
+
+
+def save_last_trade(data):
+    with open(LAST_TRADE_FILE, "w") as f:
+        json.dump(data, f)
+
+
+last_trade = load_last_trade()
+
+
+# -----------------------------------------
+# Fetch Latest Price + VWAP
+# -----------------------------------------
+def fetch_price_vwap(ticker):
     try:
-        bars = api.get_bars(symbol, TimeFrame.Minute, limit=limit, adjustment='raw').df
-        if bars.empty:
-            print(f"No data for {symbol}")
-            return None
-        # Ensure column names are consistent
-        bars = bars.rename(columns={"t": "time", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
-        return bars
+        url = f"https://data.alpaca.markets/v2/stocks/{ticker}/quotes/latest"
+        headers = {"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": API_SECRET}
+        q = requests.get(url, headers=headers).json()
+
+        price = q["quote"]["ap"]   # ask price
+        bid = q["quote"]["bp"]     # bid price
+        mid = (price + bid) / 2
+
+        # VWAP endpoint
+        vwap_url = f"https://data.alpaca.markets/v2/stocks/{ticker}/bars/latest?timeframe=1Min"
+        vwap_data = requests.get(vwap_url, headers=headers).json()
+        vwap = vwap_data["bar"]["vwap"]
+
+        return mid, vwap
+
     except Exception as e:
-        print(f"Error fetching {symbol}: {e}")
-        return None
+        print(f"Error fetching {ticker}: {e}")
+        return None, None
 
-# ==========================
-# Calculate VWAP
-# ==========================
-def calculate_vwap(df):
-    return (df['close'] * df['volume']).sum() / df['volume'].sum()
 
-# ==========================
-# Score candidate
-# ==========================
-def score_candidate(df):
-    last = df.iloc[-1]
-    price = float(last["close"])
-    vwap = calculate_vwap(df)
-    volume = float(last["volume"])
-    spread = float(last["high"]) - float(last["low"])
-    spread_threshold = float(df["high"].max() - df["low"].min())
-    
-    # Adaptive scoring based on volatility and volume
-    price_vwap_score = max(0, 1 - abs(price - vwap) / spread)  # closer to VWAP = better
-    volume_score = min(1, volume / (df['volume'].rolling(20).mean().iloc[-1] + 1))
-    spread_score = max(0, 1 - spread / (spread_threshold + 1e-5))
-    
-    # Total score weighted
-    score = 0.5 * price_vwap_score + 0.3 * volume_score + 0.2 * spread_score
-    return score, price, vwap
+# -----------------------------------------
+# Signal Calculation
+# -----------------------------------------
+def compute_signal_score(price, vwap):
+    gap = abs(price - vwap)
+    spread = max(0.01, price * 0.001)  # Hard minimum to avoid divide-by-zero
+    score = max(0, 1 - (gap / spread))
+    return score
 
-# ==========================
-# Select top candidate
-# ==========================
-def select_candidate():
-    candidates = []
-    for sym in SYMBOLS:
-        df = fetch_data(sym)
-        if df is not None and not df.empty:
-            s, price, vwap = score_candidate(df)
-            candidates.append({"symbol": sym, "score": s, "price": price, "vwap": vwap})
-    
-    if not candidates:
-        return None
-    
-    # Sort by score descending
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    
-    top = candidates[0]
-    # Check if price too far from VWAP, otherwise fallback
-    if abs(top["price"] - top["vwap"]) / (top["price"] + 1e-5) > MAX_PRICE_VWAP_DISTANCE:
-        if GUARANTEE_TRADE:
-            print(f"Price too far from VWAP for {top['symbol']}, but guaranteeing trade.")
-            return top
-        else:
-            print(f"No suitable candidates; skipping trade.")
-            return None
-    return top
 
-# ==========================
-# Submit order
-# ==========================
-def submit_order(symbol, side="buy", qty=TRADE_QTY):
+# -----------------------------------------
+# Trade Conditions
+# -----------------------------------------
+def should_trade(ticker, price, vwap):
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    # Prevent multiple trades per ticker per day
+    if last_trade.get(ticker) == today:
+        print(f"Already traded {ticker} today, skipping.")
+        return False
+
+    score = compute_signal_score(price, vwap)
+    print(f"{ticker} score: {score:.2f}")
+
+    # Require strong score (stable threshold)
+    if score < 0.65:
+        return False
+
+    return True
+
+
+# -----------------------------------------
+# Execute Buy
+# -----------------------------------------
+def place_buy(ticker, qty):
     try:
         order = api.submit_order(
-            symbol=symbol,
+            symbol=ticker,
             qty=qty,
-            side=side,
+            side="buy",
             type="market",
             time_in_force="day"
         )
-        print(f"Submitted {side.upper()} {qty} {symbol} at {datetime.now()}")
-        return order
+        print(f"Submitted BUY {qty} {ticker} at {datetime.utcnow()}")
+        return True
     except Exception as e:
-        print(f"Failed to submit {side.upper()} {symbol}: {e}")
-        return None
+        print(f"Order error for {ticker}: {e}")
+        return False
 
-# ==========================
-# Main execution
-# ==========================
-def main():
-    print(f"Starting hybrid_tradebot at {datetime.now()}")
-    candidate = select_candidate()
-    if candidate:
-        submit_order(candidate["symbol"], "buy", TRADE_QTY)
-    elif GUARANTEE_TRADE:
-        # Force trade on first symbol as fallback
-        fallback = SYMBOLS[0]
-        print(f"Forcing trade on {fallback}")
-        submit_order(fallback, "buy", TRADE_QTY)
-    else:
-        print("No trade executed this run.")
 
+# -----------------------------------------
+# MAIN LOOP
+# -----------------------------------------
+def run_bot():
+    print(f"Starting hybrid_tradebot at {datetime.utcnow()}")
+
+    global last_trade
+
+    for ticker in TICKERS:
+        price, vwap = fetch_price_vwap(ticker)
+
+        if price is None or vwap is None:
+            print(f"Skipping {ticker}, missing data.")
+            continue
+
+        if should_trade(ticker, price, vwap):
+            if place_buy(ticker, 1):
+                last_trade[ticker] = datetime.utcnow().strftime("%Y-%m-%d")
+
+    save_last_trade(last_trade)
+    print("Run complete.")
+
+
+# -----------------------------------------
+# Execute
+# -----------------------------------------
 if __name__ == "__main__":
-    main()
+    run_bot()
