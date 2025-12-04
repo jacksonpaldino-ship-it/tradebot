@@ -1,201 +1,119 @@
-# hybrid_tradebot_ready.py
-
-import os
-import time
-import json
-import logging
-from datetime import datetime, timedelta
-import pytz
 import pandas as pd
 import numpy as np
-import yfinance as yf
-import requests
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+import datetime as dt
+import time
+import alpaca_trade_api as tradeapi
 
-# -------------------- CONFIG --------------------
+# ---------------- CONFIG ----------------
+API_KEY = "YOUR_ALPACA_KEY"
+API_SECRET = "YOUR_ALPACA_SECRET"
+BASE_URL = "https://paper-api.alpaca.markets"
+
 SYMBOLS = ["SPY", "QQQ", "IWM", "DIA"]
-MIN_VOLUME = 50000
-VWAP_WEIGHT = 0.4
-VOL_WEIGHT = 0.4
-SPREAD_WEIGHT = 0.2
-FALLBACK_TIME_ET = 14  # 2PM ET for fallback
+VOL_WINDOW = 20  # lookback for volatility
 GUARANTEE_TRADE = True
-PAPER = True
+TRADE_SIZE = 1  # number of shares per trade
+TP_MULT = 0.005  # take profit 0.5%
+SL_MULT = 0.003  # stop loss 0.3%
 
-# Alpaca API
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-SIGNAL_SHEET_CSV_URL = os.getenv("SIGNAL_SHEET_CSV_URL")
+# ---------------- ALPACA ----------------
+api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
 
-client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER)
-
-# Logging and paths
-logging.basicConfig(filename="bot.log", level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-TRADES_CSV = "trades.csv"
-STATS_JSON = "trade_stats.json"
-
-logging.info("Starting hybrid_tradebot_ready")
-
-# -------------------- HELPERS --------------------
-def now_et():
-    return datetime.now(pytz.timezone("US/Eastern"))
-
-def save_trade(trade):
-    df = pd.DataFrame([trade])
-    if os.path.exists(TRADES_CSV):
-        df.to_csv(TRADES_CSV, mode='a', header=False, index=False)
-    else:
-        df.to_csv(TRADES_CSV, index=False)
-
-    stats = {}
-    if os.path.exists(STATS_JSON):
-        with open(STATS_JSON, "r") as f:
-            stats = json.load(f)
-
-    symbol = trade["symbol"]
-    if symbol not in stats:
-        stats[symbol] = {"wins":0, "losses":0, "trades":0}
-
-    stats[symbol]["trades"] += 1
-    if trade.get("result") == "WIN":
-        stats[symbol]["wins"] += 1
-    elif trade.get("result") == "LOSS":
-        stats[symbol]["losses"] += 1
-
-    with open(STATS_JSON,"w") as f:
-        json.dump(stats,f, indent=2)
-
-def submit_order(symbol, qty, side):
+# ---------------- UTILITIES ----------------
+def get_barset(symbol, limit=50):
     try:
-        order_data = MarketOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=OrderSide(side),
-            time_in_force=TimeInForce.DAY
-        )
-        order = client.submit_order(order_data)
-        logging.info(f"Order submitted: {symbol} {side} {qty}")
+        df = api.get_bars(symbol, tradeapi.TimeFrame.Minute, limit=limit).df
+        df = df[df['symbol'] == symbol]
+        return df
+    except Exception as e:
+        print(f"Failed to fetch bars for {symbol}: {e}")
+        return pd.DataFrame()
+
+def calc_volatility(df):
+    df["spread"] = df["high"] - df["low"]
+    vol = df["spread"].rolling(VOL_WINDOW).std().iloc[-1]
+    return float(vol) if not np.isnan(vol) else 0.01
+
+def score_symbol(df):
+    last = df.iloc[-1, :]
+    price = float(last["close"])
+    vwap = float(last["vwap"])
+    vol = float(last["volume"])
+    spread = float(last["high"]) - float(last["low"])
+    vol_score = vol / (vol + 1e-6)
+    spread_score = 1 - spread / (spread + 1e-6)
+    price_vwap_score = max(0, 1 - abs(price - vwap)/price)
+    score = 0.4*price_vwap_score + 0.3*vol_score + 0.3*spread_score
+    return score, price, vwap, spread, vol
+
+def submit_order(symbol, qty, side="buy"):
+    try:
+        order = api.submit_order(symbol=symbol, qty=qty, side=side, type="market", time_in_force="day")
+        print(f"Submitted {side.upper()} {qty} {symbol}")
         return order
     except Exception as e:
-        logging.error(f"Order failed {symbol} {side}: {e}")
+        print(f"Buy order failed {symbol}: {e}")
         return None
 
-def fetch_google_sheet_signals():
-    try:
-        resp = requests.get(SIGNAL_SHEET_CSV_URL, timeout=10)
-        resp.raise_for_status()
-        df = pd.read_csv(pd.compat.StringIO(resp.text)) if hasattr(pd.compat,'StringIO') else pd.read_csv(pd.io.common.StringIO(resp.text))
-        df = df[df.get("enabled", True)==True]
-        return df.to_dict("records")
-    except Exception as e:
-        logging.error(f"Failed to fetch Google Sheet: {e}")
-        return []
+def monitor_trade(symbol, entry_price):
+    tp = entry_price*(1+TP_MULT)
+    sl = entry_price*(1-SL_MULT)
+    print(f"Monitoring {symbol} entry {entry_price:.2f} TP {tp:.2f} SL {sl:.2f}")
+    for _ in range(30):  # 30 checks (adjust as needed)
+        df = get_barset(symbol, limit=1)
+        if df.empty:
+            time.sleep(5)
+            continue
+        price = float(df.iloc[-1]["close"])
+        if price >= tp:
+            print(f"{symbol} hit TP {price:.2f}")
+            submit_order(symbol, TRADE_SIZE, side="sell")
+            break
+        elif price <= sl:
+            print(f"{symbol} hit SL {price:.2f}")
+            submit_order(symbol, TRADE_SIZE, side="sell")
+            break
+        time.sleep(5)
 
-# -------------------- SCORING --------------------
-def score_symbol(symbol):
-    try:
-        df = yf.download(symbol, period="3d", interval="5m", progress=False, auto_adjust=True)
-        if df.empty: return None
-
-        df["VWAP"] = (df["Close"]*df["Volume"]).cumsum() / df["Volume"].cumsum()
-        last = df.iloc[-1]
-
-        price = float(last["Close"])
-        vwap = float(last["VWAP"])
-        volume = float(last["Volume"])
-        spread = float(last["High"]) - float(last["Low"])
-
-        if volume < MIN_VOLUME:
-            return None
-
-        vw_pct = abs(price - vwap)/vwap
-        spread_threshold = float(df["High"].max() - df["Low"].min())
-        vol_norm = min(volume/100000,1.0)
-
-        score = float((1 - vw_pct)*VWAP_WEIGHT + vol_norm*VOL_WEIGHT + (1 - spread/spread_threshold)*SPREAD_WEIGHT)
-        return {"symbol": symbol, "score": score, "price": price, "vwap": vwap, "volume": volume, "spread": spread}
-    except Exception as e:
-        logging.error(f"Error scoring {symbol}: {e}")
-        return None
-
-# -------------------- PRIMARY TRADE --------------------
-def primary_trade():
+# ---------------- MAIN ----------------
+def main():
     candidates = []
+
     for sym in SYMBOLS:
-        s = score_symbol(sym)
-        if s: candidates.append(s)
+        df = get_barset(sym)
+        if df.empty:
+            continue
+        vol = calc_volatility(df)
+        score, price, vwap, spread, volume = score_symbol(df)
+        adaptive_spread = vol*2
+        if spread <= adaptive_spread:
+            candidates.append({"symbol": sym, "score": score, "price": price})
 
-    if not candidates: return None
+    if not candidates:
+        print("No candidates found, checking guarantee...")
+        if GUARANTEE_TRADE:
+            # fallback to top-volume symbol
+            volumes = {}
+            for sym in SYMBOLS:
+                df = get_barset(sym)
+                if not df.empty:
+                    volumes[sym] = float(df.iloc[-1]["volume"])
+            if volumes:
+                top_sym = max(volumes, key=volumes.get)
+                df = get_barset(top_sym)
+                price = float(df.iloc[-1]["close"])
+                order = submit_order(top_sym, TRADE_SIZE)
+                if order:
+                    monitor_trade(top_sym, price)
+        return
 
+    # Rank candidates by score
     candidates.sort(key=lambda x: x["score"], reverse=True)
     top = candidates[0]
-    logging.info(f"Top candidate: {top['symbol']} score {top['score']:.4f}")
-
-    # Adaptive filter
-    if abs(top["price"] - top["vwap"])/top["vwap"] > 0.02:  # 2% max deviation
-        logging.info(f"{top['symbol']} price-vwap too far, forcing if guarantee")
-        if not GUARANTEE_TRADE:
-            return None
-
-    order = submit_order(top["symbol"], 1, "BUY")
+    order = submit_order(top["symbol"], TRADE_SIZE)
     if order:
-        trade = {"timestamp": now_et().isoformat(), "symbol": top["symbol"], "side":"BUY", "qty":1}
-        save_trade(trade)
-        logging.info(f"Primary trade executed: {trade}")
-        return trade
-    return None
-
-# -------------------- FALLBACK --------------------
-def fallback_trade():
-    signals = fetch_google_sheet_signals()
-    if not signals:
-        logging.info("No fallback signals")
-        return None
-
-    for sig in signals:
-        try:
-            symbol = sig.get("symbol")
-            action = sig.get("action","BUY").upper()
-            qty = int(sig.get("qty",1))
-            if not symbol: continue
-            order = submit_order(symbol, qty, action)
-            if order:
-                trade = {"timestamp": now_et().isoformat(), "symbol": symbol, "side": action, "qty": qty, "notes":"fallback"}
-                save_trade(trade)
-                logging.info(f"Fallback trade executed: {trade}")
-                return trade
-        except Exception as e:
-            logging.error(f"Fallback trade error: {e}")
-    return None
-
-# -------------------- MAIN --------------------
-def main():
-    logging.info(f"Run start ET {now_et().isoformat()}")
-    trade = primary_trade()
-    if trade: return
-
-    # Fallback after certain time
-    if now_et().hour >= FALLBACK_TIME_ET:
-        trade = fallback_trade()
-        if trade: return
-
-    # Guarantee one trade if enabled
-    if GUARANTEE_TRADE:
-        logging.info("No primary/fallback trade executed; forcing top candidate")
-        candidates = []
-        for sym in SYMBOLS:
-            s = score_symbol(sym)
-            if s: candidates.append(s)
-        if candidates:
-            candidates.sort(key=lambda x: x["score"], reverse=True)
-            top = candidates[0]
-            order = submit_order(top["symbol"],1,"BUY")
-            if order:
-                trade = {"timestamp": now_et().isoformat(), "symbol": top["symbol"], "side":"BUY", "qty":1, "notes":"guaranteed"}
-                save_trade(trade)
-                logging.info(f"Guaranteed trade executed: {trade}")
+        monitor_trade(top["symbol"], top["price"])
 
 if __name__ == "__main__":
+    print("Starting hybrid_tradebot_advanced")
     main()
