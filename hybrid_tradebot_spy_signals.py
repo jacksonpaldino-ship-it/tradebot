@@ -260,14 +260,36 @@ def submit_market_order(symbol, qty, side_str):
     else:
         logging.error(f"Invalid side: {side_str}")
         return None
-    req = MarketOrderRequest(symbol=symbol, qty=qty, side=side_enum, time_in_force=TimeInForce.DAY)
-    try:
-        order = backoff_attempt(client.submit_order, req)
-        logging.info(f"Submitted {side} {qty} {symbol}")
-        return order
-    except Exception as e:
-        logging.error(f"Submit market order failed {symbol} {side}: {e}")
+
+    # Basic validation
+    if not symbol or str(symbol).strip() == "":
+        logging.error("submit_market_order called with empty symbol; skipping.")
         return None
+
+    req = MarketOrderRequest(symbol=symbol, qty=qty, side=side_enum, time_in_force=TimeInForce.DAY)
+
+    # Custom backoff that stops retrying on client (4xx) errors
+    attempt = 0
+    max_attempts = 5
+    base_delay = 1.0
+    while True:
+        try:
+            order = client.submit_order(req)
+            logging.info(f"Submitted {side} {qty} {symbol}")
+            return order
+        except Exception as e:
+            attempt += 1
+            msg = str(e)
+            # If Alpaca returned a 4xx style error, don't retry
+            if "400" in msg or "4" in msg and "code" in msg:
+                logging.error(f"Client error on submit: {e} — not retrying.")
+                return None
+            if attempt >= max_attempts:
+                logging.error(f"Submit failed after {attempt} attempts: {e}")
+                return None
+            delay = base_delay * (2 ** (attempt - 1)) + 0.1 * attempt
+            logging.warning(f"Attempt {attempt} failed: {e}. Retrying in {delay:.1f}s")
+            time.sleep(delay)
 
 def get_filled_price_from_order_obj(order_obj):
     # alpaca-py order object fields vary; attempt common attributes
@@ -369,11 +391,17 @@ def fetch_signals_from_sheet(url):
         df.columns = [c.strip().lower() for c in df.columns]
         if "enabled" in df.columns:
             df = df[df["enabled"].astype(str).str.lower().isin(["true","1","yes","y"])]
+        # Clean and drop rows without symbol
+        if "symbol" in df.columns:
+            df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
+            df = df[df["symbol"].notna() & (df["symbol"] != "")]
+        else:
+            # no symbol column -> nothing to do
+            return []
         return df.to_dict("records")
     except Exception as e:
         logging.error(f"Failed to fetch sheet: {e}")
         return []
-
 # -----------------------------
 # Candidate selection & execution
 # -----------------------------
