@@ -1,123 +1,120 @@
-#!/usr/bin/env python3
-# hybrid_tradebot_spy_signals.py
-# Fully functional intraday bot with guaranteed 1 trade/day
-
 import os
-import time
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from alpaca_trade_api.rest import REST, TimeFrame
-import pytz
 
-# ----------------------
-# CONFIG
-# ----------------------
+# -----------------------
+# CONFIGURATION
+# -----------------------
 SYMBOLS = ["SPY", "QQQ", "IWM", "DIA"]
-TRADE_AMOUNT = 1  # shares per trade
-MARKET_TIMEZONE = pytz.timezone("America/New_York")
+TRADE_QUANTITY = 1  # number of shares/contracts to buy
+GUARANTEE_TRADE = True
 
-# Get Alpaca keys from environment
-API_KEY = os.getenv("APCA_API_KEY_ID")
-API_SECRET = os.getenv("APCA_API_SECRET_KEY")
-BASE_URL = os.getenv("APCA_API_BASE_URL")  # Paper or live
+# Read secrets from GitHub Actions environment
+API_KEY = os.getenv("ALPACA_API_KEY")
+API_SECRET = os.getenv("ALPACA_SECRET_KEY")
+BASE_URL = os.getenv("ALPACA_BASE_URL")
 
-if not all([API_KEY, API_SECRET, BASE_URL]):
-    raise ValueError("API credentials missing. Set APCA_API_KEY_ID, APCA_API_SECRET_KEY, APCA_API_BASE_URL")
+if not API_KEY or not API_SECRET or not BASE_URL:
+    raise ValueError("API credentials missing. Set ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL")
 
 api = REST(API_KEY, API_SECRET, BASE_URL)
 
-# ----------------------
-# UTILITY FUNCTIONS
-# ----------------------
+# -----------------------
+# DATA FETCHING
+# -----------------------
 def fetch_data(symbol, limit=50):
-    """Fetch intraday bars"""
-    df = api.get_bars(symbol, TimeFrame.Minute, limit=limit, adjustment='raw').df
-    df = df[df['symbol'] == symbol]
-    return df
+    """Fetch minute bars and return DataFrame"""
+    try:
+        barset = api.get_bars(symbol, TimeFrame.Minute, limit=limit, adjustment='raw').df
+        barset = barset[barset['symbol'] == symbol]
+        return barset
+    except Exception as e:
+        print(f"Error fetching {symbol}: {e}")
+        return None
 
+# -----------------------
+# SCORING FUNCTION
+# -----------------------
 def score_candidate(df):
-    """Compute a score for the symbol"""
+    """Compute a score based on price-vwap distance, spread, and volume"""
     last = df.iloc[-1]
-    close = float(last["close"])
-    high = float(last["high"])
-    low = float(last["low"])
-    volume = float(last["volume"])
-    vwap = float(last["vwap"]) if "vwap" in last else (df["close"] * df["volume"]).sum() / df["volume"].sum()
-    spread = high - low
+    last_price = float(last["close"])
+    vwap = float(last["vwap"]) if "vwap" in last else last_price
+    spread = float(last["high"]) - float(last["low"])
+    spread_threshold = float(df["high"].max() - df["low"].min())
+    volume_factor = float(last["volume"]) / (df["volume"].mean() + 1)
+    
+    # Adaptive thresholds based on spread
+    spread_score = max(0, 1 - (spread / (spread_threshold + 1e-6)))
+    price_vwap_score = max(0, 1 - abs(last_price - vwap)/ (vwap + 1e-6))
+    score = 0.4 * spread_score + 0.4 * price_vwap_score + 0.2 * volume_factor
+    return score
 
-    # Adaptive thresholds
-    spread_threshold = df["high"].max() - df["low"].min()
-    price_vwap_diff = abs(close - vwap)
-
-    # Volume-weighted score
-    vol_score = min(volume / df["volume"].max(), 1.0)
-    spread_score = max(0, 1 - spread / (spread_threshold + 1e-6))
-    price_score = max(0, 1 - price_vwap_diff / (spread_threshold + 1e-6))
-
-    total_score = (0.4 * price_score + 0.3 * spread_score + 0.3 * vol_score)
-    return total_score, close, vwap, volume, spread
-
+# -----------------------
+# CANDIDATE SELECTION
+# -----------------------
 def select_candidate():
-    """Select the best candidate symbol"""
     candidates = []
     for sym in SYMBOLS:
-        try:
-            df = fetch_data(sym)
-            score, close, vwap, volume, spread = score_candidate(df)
-            candidates.append({
-                "symbol": sym,
-                "score": score,
-                "close": close,
-                "vwap": vwap,
-                "volume": volume,
-                "spread": spread
-            })
-        except Exception as e:
-            print(f"Error scoring {sym}: {e}")
+        df = fetch_data(sym)
+        if df is not None and not df.empty:
+            try:
+                score = score_candidate(df)
+                candidates.append({"symbol": sym, "score": score, "last_price": float(df.iloc[-1]["close"])})
+            except Exception as e:
+                print(f"Error scoring {sym}: {e}")
+    
     if not candidates:
-        raise RuntimeError("No valid candidates found")
-    # Rank by score
+        return None
+    
+    # Sort by score descending
     candidates.sort(key=lambda x: x["score"], reverse=True)
-    return candidates[0]  # top candidate
+    top = candidates[0]
+    print(f"Top candidate: {top['symbol']} score {top['score']:.4f}")
+    return top
 
-def submit_order(symbol, qty=TRADE_AMOUNT):
-    """Submit a market buy order"""
+# -----------------------
+# TRADE EXECUTION
+# -----------------------
+def place_trade(candidate):
     try:
+        symbol = candidate["symbol"]
+        qty = TRADE_QUANTITY
         order = api.submit_order(
             symbol=symbol,
             qty=qty,
-            side="buy",
-            type="market",
-            time_in_force="day"
+            side='buy',
+            type='market',
+            time_in_force='day'
         )
         print(f"Submitted BUY {qty} {symbol}")
         return order
     except Exception as e:
-        print(f"Buy order failed {symbol}: {e}")
+        print(f"Buy order failed {candidate['symbol']}: {e}")
         return None
 
-# ----------------------
-# MAIN BOT
-# ----------------------
+# -----------------------
+# MAIN LOOP
+# -----------------------
 def main():
-    print("Starting hybrid_tradebot_advanced")
-    now = datetime.now(MARKET_TIMEZONE)
-    print(f"Run start ET {now.isoformat()}")
+    print(f"Starting hybrid_tradebot at {datetime.now(timezone.utc).astimezone().isoformat()}")
+    
+    candidate = select_candidate()
+    order = None
 
-    try:
-        candidate = select_candidate()
-        print(f"Top candidate: {candidate['symbol']} score {candidate['score']:.4f} "
-              f"(vwap {candidate['vwap']:.3f} vol {candidate['volume']:.0f} spread {candidate['spread']:.3f})")
+    if candidate:
+        order = place_trade(candidate)
+    
+    # Guarantee a trade if nothing executed
+    if GUARANTEE_TRADE and order is None and candidate:
+        print(f"Forcing top candidate trade: {candidate['symbol']}")
+        order = place_trade(candidate)
 
-        # Guarantee at least one trade
-        order = submit_order(candidate['symbol'])
-        if order:
-            print(f"{candidate['symbol']} buy filled")
-        else:
-            print("Order failed, exiting")
-    except Exception as e:
-        print(f"Primary selection failed: {e}")
-        print("No trade executed this run")
+    if order:
+        print("Trade executed, monitoring disabled for simplicity in this version.")
+    else:
+        print("No trade executed this run.")
 
 if __name__ == "__main__":
     main()
