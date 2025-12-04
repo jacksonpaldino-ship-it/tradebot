@@ -440,9 +440,43 @@ def execute_candidate(candidate, force=False):
         logging.error(f"Buy order failed for {symbol}")
         return None
 
-    entry_price = get_filled_price_from_order_obj(buy_order) or price
-    logging.info(f"{symbol} buy filled at {entry_price:.4f}")
+# after buy_order returned successfully
+entry_price = get_filled_price_from_order_obj(buy_order) or current_market_price_estimate
+
+# check market open
+try:
+    clock = client.get_clock()
+    market_open = bool(getattr(clock, "is_open", False))
+except Exception as e:
+    logging.warning(f"Could not fetch market clock: {e}")
+    market_open = True  # be conservative: assume open if we cannot check
+
+if not market_open:
+    logging.info("Market is closed right after entry — exiting immediately to avoid holding overnight.")
+    sell_order = submit_market_order(symbol, qty, "SELL")
+    exit_price = get_filled_price_from_order_obj(sell_order) or entry_price
+    pnl = (exit_price - entry_price) * qty
+    trade = {
+        "timestamp": datetime.now(pytz.utc).isoformat(),
+        "source": "PRIMARY",
+        "symbol": symbol,
+        "side": "LONG",
+        "qty": qty,
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "pnl": round(pnl, 4),
+        "result": "CLOSED_MARKET",
+        "notes": "Market closed at entry, immediate exit",
+        "tp_price": None,
+        "sl_price": None
+    }
+    append_trade_log(trade)
+    logging.info(f"Immediate exit logged: {trade}")
+    return trade
+else:
+    # proceed with normal monitor_and_exit(...)
     return monitor_and_exit(symbol, qty, entry_price, tp_price, sl_price)
+
 
 # -----------------------------
 # Orchestrator
