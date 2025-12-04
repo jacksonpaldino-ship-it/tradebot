@@ -1,118 +1,132 @@
 import os
 import time
-import datetime
 import pandas as pd
 import numpy as np
 from alpaca_trade_api.rest import REST, TimeFrame
 
-# --- CONFIGURATION ---
-API_KEY = os.getenv("ALPACA_API_KEY")
-API_SECRET = os.getenv("ALPACA_API_SECRET")
-BASE_URL = os.getenv("ALPACA_API_URL", "https://paper-api.alpaca.markets")
-SYMBOLS = ["SPY", "QQQ", "IWM", "DIA"]
-TRADE_SIZE = 1  # number of shares per trade
-GUARANTEE_TRADE = True  # force at least 1 trade per day
+# Alpaca credentials (from environment)
+API_KEY = os.getenv("APCA_API_KEY_ID")
+API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+BASE_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
 
-# Stop-loss / Take-profit % (relative to entry)
-TP_PCT = 0.005  # 0.5%
-SL_PCT = 0.002  # 0.2%
-
-# Alpaca client
 api = REST(API_KEY, API_SECRET, BASE_URL)
 
-# --- UTILITIES ---
-def fetch_bars(symbol, limit=20):
-    df = api.get_bars(symbol, TimeFrame.Minute, limit=limit).df
-    df = df[df['symbol'] == symbol]
-    df = df[['open', 'high', 'low', 'close', 'volume']]
-    df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
-    df['VWAP'] = (df['Close'] * df['Volume']).cumsum() / df['Volume'].cumsum()
+SYMBOLS = ["SPY", "QQQ", "IWM", "DIA"]
+TRADE_SIZE = 1  # number of shares per trade
+GUARANTEE_TRADE = True
+VOLATILITY_LOOKBACK = 20  # candles
+
+TP_PERCENT = 0.5 / 100  # Take profit 0.5%
+SL_PERCENT = 0.3 / 100  # Stop loss 0.3%
+
+def fetch_data(symbol, limit=50):
+    barset = api.get_bars(symbol, TimeFrame.Minute, limit=limit, adjustment='raw').df
+    if barset.empty:
+        return None
+    df = barset[barset['symbol'] == symbol]
     return df
 
-def score_symbol(df):
+def calculate_score(df):
     last = df.iloc[-1]
-    price = float(last["Close"])
-    vwap = float(last["VWAP"])
-    volume = float(last["Volume"])
-    spread = float(last["High"]) - float(last["Low"])
+    price = float(last["close"])
+    vwap = float(df["close"].mean())  # simple VWAP proxy
+    volume = float(last["volume"])
+    spread = float(last["high"]) - float(last["low"])
     
-    # Adaptive thresholds
-    spread_threshold = float(df["High"].max() - df["Low"].min())
-    vwap_thresh = spread_threshold * 0.5
-    vol_norm = min(volume / (df["Volume"].rolling(20).mean().iloc[-1]+1e-6), 1.0)
+    # Adaptive thresholds based on recent volatility
+    recent_spreads = df["high"] - df["low"]
+    spread_threshold = recent_spreads.mean() * 1.1  # 10% above avg
+    vol_threshold = df["volume"].mean()
     
-    # Score components
-    vwap_score = max(0, 1 - abs(price - vwap)/vwap_thresh)
-    spread_score = max(0, 1 - spread/spread_threshold)
-    score = 0.5*vwap_score + 0.3*vol_norm + 0.2*spread_score
-    return score, price, vwap, spread
+    score = 0
+    # Price close to VWAP
+    score += max(0, 1 - abs(price - vwap)/vwap)
+    # Spread low
+    score += max(0, 1 - spread/spread_threshold)
+    # Volume high
+    score += min(volume / vol_threshold, 1)
+    
+    return score, price, spread, volume, vwap
 
-def select_best_symbol():
+def select_candidate():
     candidates = []
     for sym in SYMBOLS:
-        try:
-            df = fetch_bars(sym)
-            score, price, vwap, spread = score_symbol(df)
-            candidates.append({"symbol": sym, "score": score, "price": price, "vwap": vwap, "spread": spread})
-        except Exception as e:
-            print(f"Error scoring {sym}: {e}")
+        df = fetch_data(sym)
+        if df is None or df.empty:
+            continue
+        score, price, spread, volume, vwap = calculate_score(df)
+        candidates.append({
+            "symbol": sym,
+            "score": score,
+            "price": price,
+            "spread": spread,
+            "volume": volume,
+            "vwap": vwap
+        })
     if not candidates:
         return None
-    # Sort by score
+    # Rank by score
     candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates[0]
 
-def submit_trade(symbol, qty=TRADE_SIZE):
+def submit_order(symbol, qty, side):
     try:
         order = api.submit_order(
             symbol=symbol,
             qty=qty,
-            side='buy',
+            side=side,
             type='market',
             time_in_force='day'
         )
-        print(f"Submitted BUY {qty} {symbol}")
         return order
     except Exception as e:
-        print(f"Buy order failed {symbol}: {e}")
+        print(f"Order failed {symbol}: {e}")
         return None
 
 def monitor_trade(symbol, entry_price):
-    tp = entry_price * (1 + TP_PCT)
-    sl = entry_price * (1 - SL_PCT)
+    tp = entry_price * (1 + TP_PERCENT)
+    sl = entry_price * (1 - SL_PERCENT)
     print(f"Monitoring {symbol} entry {entry_price:.2f} TP {tp:.2f} SL {sl:.2f}")
     while True:
-        bar = fetch_bars(symbol, limit=1).iloc[-1]
-        price = float(bar["Close"])
-        if price >= tp:
-            api.submit_order(symbol=symbol, qty=TRADE_SIZE, side='sell', type='market', time_in_force='day')
-            print(f"{symbol} hit TP at {price:.2f}, sold")
+        bar = fetch_data(symbol, limit=1)
+        if bar is None or bar.empty:
+            time.sleep(10)
+            continue
+        last_price = float(bar.iloc[-1]["close"])
+        print(f"{symbol} price {last_price:.2f}")
+        if last_price >= tp:
+            print(f"{symbol} hit take profit at {last_price:.2f}")
+            submit_order(symbol, TRADE_SIZE, "sell")
             break
-        if price <= sl:
-            api.submit_order(symbol=symbol, qty=TRADE_SIZE, side='sell', type='market', time_in_force='day')
-            print(f"{symbol} hit SL at {price:.2f}, sold")
+        elif last_price <= sl:
+            print(f"{symbol} hit stop loss at {last_price:.2f}")
+            submit_order(symbol, TRADE_SIZE, "sell")
             break
-        time.sleep(30)
+        time.sleep(30)  # check every 30 seconds
 
 def main():
-    print("Starting hybrid_tradebot_advanced")
-    best = select_best_symbol()
-    if not best:
-        print("No valid candidates. Exiting.")
+    candidate = select_candidate()
+    if candidate is None:
+        print("No valid candidate. Exiting.")
         return
-
-    # Guarantee at least one trade
-    if best["score"] < 0.1 and GUARANTEE_TRADE:
-        print(f"Forcing top-ranked candidate {best['symbol']} due to guarantee flag.")
     
-    order = submit_trade(best["symbol"])
-    if order:
-        # Wait a few seconds for fill
-        time.sleep(5)
-        # Fetch last trade price
-        filled_price = float(api.get_position(best["symbol"]).avg_entry_price)
-        monitor_trade(best["symbol"], filled_price)
-    print("Run complete.")
+    print(f"Top candidate: {candidate['symbol']} score {candidate['score']:.3f}")
+    
+    # Check thresholds
+    price_diff = abs(candidate["price"] - candidate["vwap"])/candidate["vwap"]
+    if price_diff > 0.02:  # price too far from vwap
+        print(f"{candidate['symbol']} price-vwap {price_diff:.3f} too far")
+        if not GUARANTEE_TRADE:
+            return
+        print("Forcing top-ranked candidate due to guarantee flag.")
+    
+    order = submit_order(candidate["symbol"], TRADE_SIZE, "buy")
+    if order is None:
+        print(f"Buy order failed {candidate['symbol']}")
+        return
+    
+    print(f"{candidate['symbol']} buy filled at {candidate['price']:.2f}")
+    monitor_trade(candidate["symbol"], candidate['price'])
 
 if __name__ == "__main__":
     main()
