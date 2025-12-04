@@ -1,16 +1,16 @@
 # hybrid_tradebot_advanced.py
 """
-Advanced hybrid trading bot
-- Multi-symbol primary strategy with adaptive thresholds (ATR/volatility-based)
-- Volume-weighted probability scoring to rank symbols
-- Google Sheet fallback (optional) after fallback time
-- Guaranteed trade option (force top-ranked candidate if nothing passes)
-- Stop-loss / take-profit per trade (defaults or from sheet)
-- Robust Alpaca order submission with backoff/retry
-- CSV logging (trades.csv) and per-symbol stats (trade_stats.json)
-- Avoids pandas FutureWarnings by using .iloc[0] where appropriate
+Advanced hybrid trading bot — corrected and hardened.
 
-Config section below - tune to your account and risk profile.
+Features:
+- Multi-symbol adaptive filtering (ATR-based)
+- Volume-weighted probability scoring and ranking
+- Optional guaranteed trade per day (force top candidate)
+- Google Sheet fallback (CSV export URL)
+- Robust Alpaca order submission with backoff
+- In-process monitoring for TP/SL and market exits
+- CSV trade logging and per-symbol stats (trade_stats.json)
+- Uses .iloc[...] and robust conversions to avoid pandas FutureWarning / Series truth errors
 """
 
 import os
@@ -19,9 +19,10 @@ import math
 import json
 import logging
 from datetime import datetime
+from io import StringIO
+
 import pytz
 import requests
-
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -33,49 +34,46 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 # -------------------------
 # CONFIG
 # -------------------------
-SYMBOLS = ["SPY", "QQQ", "IWM", "DIA"]  # symbols to evaluate
-LOOKBACK_MINUTES = 60 * 6  # lookback in minutes for volatility/volume (e.g., 6 hours)
-CANDLE_INTERVAL = "5m"     # interval for data used in signals
+SYMBOLS = ["SPY", "QQQ", "IWM", "DIA"]
+CANDLE_INTERVAL = "5m"
+LOOKBACK_DAYS = 3
 
-# Base (fallback) percent targets - used to compute TP/SL from entry price
-DEFAULT_TP_PCT = 0.005     # 0.5% take profit
-DEFAULT_SL_PCT = 0.003     # 0.3% stop loss
+DEFAULT_TP_PCT = 0.005     # 0.5%
+DEFAULT_SL_PCT = 0.003     # 0.3%
 
-# Volatility multiplier controls aggressiveness of thresholds
-VWAP_VOLATILITY_MULTIPLIER = 0.7  # multiplies ATR to allow VWAP distance
-MAX_SPREAD_MULTIPLIER = 1.5       # allows up to this * ATR for candle spread
-MIN_VOLUME_MULTIPLIER = 0.5       # require recent volume >= multiplier * median(volume)
+# Adaptive multipliers
+VWAP_VOLATILITY_MULTIPLIER = 0.7
+MAX_SPREAD_MULTIPLIER = 1.5
+MIN_VOLUME_MULTIPLIER = 0.5
 
-# Scoring weights (how much each factor contributes to final score; sum not required)
+# Scoring weights
 SCORE_WEIGHT_VWAP = 0.45
 SCORE_WEIGHT_VOLUME = 0.30
 SCORE_WEIGHT_SPREAD = 0.25
 
-# Fallback to sheet config
+# Fallback sheet (CSV export URL)
 SIGNAL_SHEET_CSV_URL = os.getenv("SIGNAL_SHEET_CSV_URL", "").strip()
 
-# Guarantee at least one trade per day if True (will force top-ranked candidate)
+# Guarantee one trade per day (force top candidate)
 GUARANTEE_ONE_TRADE_PER_DAY = True
 
-# Fallback time (ET hour) to use sheet if primary did not trade
-FALLBACK_TIME_ET = 14  # 2pm ET
+# Fallback time (ET hour)
+FALLBACK_TIME_ET = 14
 
-# Alpaca config (from env)
+# Alpaca config (env)
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 PAPER = True  # set False for live
 
-# Files
+# Files & monitoring
 TRADES_CSV = "trades.csv"
 STATS_JSON = "trade_stats.json"
 LOG_FILE = "bot.log"
-
-# Monitoring/exit parameters (in seconds)
 MONITOR_INTERVAL = 15
-MONITOR_TIMEOUT = 60 * 60  # 1 hour max
+MONITOR_TIMEOUT = 60 * 60  # 1 hour
 
 # -------------------------
-# SAFETY / VALIDATION
+# VALIDATION
 # -------------------------
 if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
     raise SystemExit("ALPACA_API_KEY and ALPACA_SECRET_KEY environment variables required.")
@@ -86,8 +84,8 @@ if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
 logging.basicConfig(filename=LOG_FILE,
                     level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
-logging.getLogger().addHandler(logging.StreamHandler())  # also print to console
-logging.info("Starting hybrid_tradebot_advanced")
+logging.getLogger().addHandler(logging.StreamHandler())
+logging.info("Starting hybrid_tradebot_advanced (corrected)")
 
 # -------------------------
 # Alpaca client
@@ -101,13 +99,19 @@ def now_et():
     return datetime.now(pytz.timezone("America/New_York"))
 
 def safe_float(x):
+    """Robust conversion to float for pandas scalars/Series/numpy types/py scalars."""
     try:
+        # pandas Series or Index — return first element
+        if hasattr(x, "iloc"):
+            return float(x.iloc[0])
+        # numpy scalar or python scalar
         return float(x)
     except Exception:
+        # as last resort, try item()
         try:
-            return float(x.iloc[0])
+            return float(getattr(x, "item", lambda: x)())
         except Exception:
-            raise
+            raise ValueError(f"Could not convert {type(x)} value to float: {x}")
 
 def backoff_attempt(func, *args, max_attempts=5, base_delay=1.0, **kwargs):
     attempt = 0
@@ -124,7 +128,7 @@ def backoff_attempt(func, *args, max_attempts=5, base_delay=1.0, **kwargs):
             time.sleep(delay)
 
 # -------------------------
-# Logging + Stats helpers
+# Logging / stats helpers
 # -------------------------
 def ensure_logs():
     if not os.path.exists(TRADES_CSV):
@@ -137,16 +141,15 @@ def ensure_logs():
 
 def append_trade_log(trade: dict):
     ensure_logs()
-    df = pd.DataFrame([trade])
-    df.to_csv(TRADES_CSV, mode="a", header=False, index=False)
+    pd.DataFrame([trade]).to_csv(TRADES_CSV, mode="a", header=False, index=False)
     # update stats
     stats = {}
     if os.path.exists(STATS_JSON):
-        with open(STATS_JSON, "r") as f:
-            try:
+        try:
+            with open(STATS_JSON, "r") as f:
                 stats = json.load(f)
-            except Exception:
-                stats = {}
+        except Exception:
+            stats = {}
     sym = trade["symbol"]
     if sym not in stats:
         stats[sym] = {"trades": 0, "wins": 0, "losses": 0}
@@ -159,10 +162,9 @@ def append_trade_log(trade: dict):
         json.dump(stats, f, indent=2)
 
 # -------------------------
-# Market metrics & scoring
+# Market data & metrics
 # -------------------------
-def get_recent_bars(symbol, period_days=3, interval=CANDLE_INTERVAL):
-    """Return dataframe from yfinance for recent bars (auto_adjust True)."""
+def get_recent_bars(symbol, period_days=LOOKBACK_DAYS, interval=CANDLE_INTERVAL):
     try:
         df = yf.download(symbol, period=f"{period_days}d", interval=interval, progress=False, auto_adjust=True)
         return df
@@ -171,7 +173,6 @@ def get_recent_bars(symbol, period_days=3, interval=CANDLE_INTERVAL):
         return pd.DataFrame()
 
 def compute_atr(df, n=14):
-    """Compute ATR-like measure using high-low range average (simple) over n bars."""
     if df.empty or len(df) < 2:
         return None
     high = df["High"]
@@ -188,57 +189,56 @@ def compute_vwap(df):
 def compute_recent_volume_median(df):
     if df.empty:
         return None
-    return df["Volume"].tail(20).median()
+    return safe_float(df["Volume"].tail(20).median())
 
+# -------------------------
+# Scoring
+# -------------------------
 def score_candidate(symbol):
-    """
-    Returns a dict with metrics and a combined score for ranking.
-    Higher score = better candidate.
-    """
-    df = get_recent_bars(symbol, period_days=3, interval=CANDLE_INTERVAL)
+    df = get_recent_bars(symbol)
     if df.empty:
         logging.info(f"No data for {symbol}")
         return None
-
     vwap_series = compute_vwap(df)
     if vwap_series is None:
         return None
+    df = df.copy()
     df["VWAP"] = vwap_series
     last = df.iloc[-1]
-    price = safe_float(last["Close"])
-    vwap = safe_float(last["VWAP"])
-    volume = safe_float(last["Volume"])
-    spread = safe_float(last["High"]) - safe_float(last["Low"])
+    try:
+        price = safe_float(last["Close"])
+        vwap = safe_float(last["VWAP"])
+        volume = safe_float(last["Volume"])
+        spread = safe_float(last["High"]) - safe_float(last["Low"])
+    except Exception as e:
+        logging.error(f"safe_float error for {symbol}: {e}")
+        return None
 
-    # ATR (volatility) baseline
     atr = compute_atr(df, n=14) or max(0.01, abs(price) * 0.0005)
-    if atr <= 0:
-        atr = max(0.01, abs(price) * 0.0005)
+    atr = max(0.0001, atr)
 
-    # adaptive thresholds derived from recent volatility
     allowed_vwap_dist = VWAP_VOLATILITY_MULTIPLIER * atr
     allowed_spread = MAX_SPREAD_MULTIPLIER * atr
-    min_volume = MIN_VOLUME_MULTIPLIER * compute_recent_volume_median(df) if compute_recent_volume_median(df) is not None else MIN_VOLUME_MULTIPLIER * 1000
+    median_vol = compute_recent_volume_median(df) or 1000.0
+    min_volume = MIN_VOLUME_MULTIPLIER * median_vol
 
-    # compute normalized metrics for scoring (0..1 higher is better)
-    # VWAP closeness: closer -> higher score (1 when price==vwap)
+    # normalized metrics
     vwap_dist = abs(price - vwap)
     vwap_score = max(0.0, 1.0 - min(vwap_dist / (allowed_vwap_dist * 2 + 1e-9), 1.0))
 
-    # Volume score: higher than median -> higher score; saturate at 2x median
-    median_vol = compute_recent_volume_median(df) or 1.0
     volume_ratio = volume / (median_vol + 1e-9)
-    volume_score = min(1.0, (volume_ratio - 0.5) / 1.5) if volume_ratio >= 0.5 else 0.0
+    if volume_ratio <= 0.5:
+        volume_score = 0.0
+    else:
+        volume_score = min(1.0, (volume_ratio - 0.5) / 1.5)
 
-    # Spread score: smaller spread -> higher score
     spread_score = max(0.0, 1.0 - min(spread / (allowed_spread * 2 + 1e-9), 1.0))
 
-    # combine with weights
     combined_score = (SCORE_WEIGHT_VWAP * vwap_score +
                       SCORE_WEIGHT_VOLUME * volume_score +
                       SCORE_WEIGHT_SPREAD * spread_score)
 
-    metrics = {
+    return {
         "symbol": symbol,
         "price": price,
         "vwap": vwap,
@@ -252,41 +252,48 @@ def score_candidate(symbol):
         "vwap_score": vwap_score,
         "volume_score": volume_score,
         "spread_score": spread_score,
-        "combined_score": combined_score,
+        "combined_score": combined_score
     }
-    return metrics
 
 # -------------------------
-# Trading helpers (entry + monitoring exit)
+# Trading helpers
 # -------------------------
 def submit_market_order(symbol, qty, side):
-    """Submit market order with backoff and return order object or None"""
     try:
         req = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide(side), time_in_force=TimeInForce.DAY)
         order = backoff_attempt(client.submit_order, req)
         logging.info(f"Submitted {side} {qty} {symbol}")
         return order
     except Exception as e:
-        logging.error(f"Submit market order failed {symbol} {side}: {e}")
+        logging.error(f"Submit market order failed {symbol}: {e}")
         return None
 
 def get_filled_price_from_order(order):
-    """Try to extract filled price from order object, robust to client variants"""
+    # Try multiple attributes depending on client shape
+    for attr in ("filled_avg_price", "filled_avg", "filled_avgprice", "filled_price"):
+        try:
+            val = getattr(order, attr, None)
+            if val is not None:
+                return safe_float(val)
+        except Exception:
+            continue
+    # Some objects store fills in a dict-like field
     try:
-        price = getattr(order, "filled_avg_price", None) or getattr(order, "filled_avg", None)
-        if price is not None:
-            return safe_float(price)
+        if hasattr(order, "fills") and order.fills:
+            first = order.fills[0]
+            if isinstance(first, dict) and "price" in first:
+                return safe_float(first["price"])
     except Exception:
         pass
     return None
 
 def monitor_and_exit(symbol, qty, entry_price, tp_price, sl_price):
-    """Poll market price until TP or SL hit or timeout, then execute market sell"""
     start = time.time()
     exit_price = None
     result = None
     notes = ""
     logging.info(f"Monitoring {symbol} entry {entry_price:.4f} TP {tp_price:.4f} SL {sl_price:.4f}")
+    last_px = entry_price
     while True:
         if time.time() - start > MONITOR_TIMEOUT:
             notes = "timeout"
@@ -317,15 +324,15 @@ def monitor_and_exit(symbol, qty, entry_price, tp_price, sl_price):
 
         time.sleep(MONITOR_INTERVAL)
 
-    # perform sell market
+    # Execute sell market
     sell_order = submit_market_order(symbol, qty, "SELL")
     if sell_order:
-        filled = get_filled_price_from_order(sell_order)
-        if filled:
-            exit_price = filled
+        fp = get_filled_price_from_order(sell_order)
+        if fp:
+            exit_price = fp
+
     if exit_price is None:
-        # fallback to last_px or entry_price
-        exit_price = exit_price or entry_price
+        exit_price = last_px or entry_price
 
     pnl = (exit_price - entry_price) * qty
     trade = {
@@ -347,7 +354,7 @@ def monitor_and_exit(symbol, qty, entry_price, tp_price, sl_price):
     return trade
 
 # -------------------------
-# Signal sheet helpers
+# Sheet helpers
 # -------------------------
 def fetch_signals_from_sheet(url):
     if not url:
@@ -355,9 +362,8 @@ def fetch_signals_from_sheet(url):
     try:
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
-        df = pd.read_csv(pd.compat.StringIO(resp.text))
+        df = pd.read_csv(StringIO(resp.text))
         df.columns = [c.strip().lower() for c in df.columns]
-        # require enabled column true if present
         if "enabled" in df.columns:
             df = df[df["enabled"].astype(str).str.lower().isin(["true","1","yes","y"])]
         return df.to_dict("records")
@@ -366,85 +372,71 @@ def fetch_signals_from_sheet(url):
         return []
 
 # -------------------------
-# Main logic: evaluate, rank, choose candidate
+# Candidate selection & execution
 # -------------------------
-def choose_best_candidate(symbols):
-    candidates = []
+def choose_best_candidates(symbols):
+    metrics = []
     for s in symbols:
         try:
             m = score_candidate(s)
             if m:
-                candidates.append(m)
+                metrics.append(m)
         except Exception as e:
             logging.error(f"Error scoring {s}: {e}")
-    if not candidates:
-        return None
-    # sort by combined_score descending
-    candidates.sort(key=lambda x: x["combined_score"], reverse=True)
-    return candidates
+    if not metrics:
+        return []
+    metrics.sort(key=lambda x: x["combined_score"], reverse=True)
+    return metrics
 
 def execute_candidate(candidate, force=False):
-    """
-    candidate: metrics dict from score_candidate
-    force: if True, we'll execute even if some criteria fail (for guarantee)
-    """
     symbol = candidate["symbol"]
     price = candidate["price"]
-    qty = 1  # TODO: position sizing later
-    # derive TP/SL from price and candidate ATR (conservative)
+    qty = 1
     tp_price = price * (1 + DEFAULT_TP_PCT)
     sl_price = price * (1 - DEFAULT_SL_PCT)
 
-    # If not forced, enforce adaptive minimum conditions
     if not force:
         if candidate["volume"] < candidate["min_volume"]:
-            logging.info(f"{symbol} volume {candidate['volume']} < min {candidate['min_volume']} -> skip")
+            logging.info(f"{symbol} volume {candidate['volume']} < min {candidate['min_volume']:.1f}")
             return None
         if candidate["spread"] > candidate["allowed_spread"]:
-            logging.info(f"{symbol} spread {candidate['spread']:.4f} > allowed {candidate['allowed_spread']:.4f} -> skip")
+            logging.info(f"{symbol} spread {candidate['spread']:.4f} > allowed {candidate['allowed_spread']:.4f}")
             return None
-        # price distance from VWAP should be within allowed_vwap_dist
-        if abs(price - candidate["vwap"]) > candidate["allowed_vwap_dist"] * 2:
-            logging.info(f"{symbol} price-vwap {abs(price-candidate['vwap']):.4f} too far -> skip")
+        if abs(price - candidate["vwap"]) > (candidate["allowed_vwap_dist"] * 2):
+            logging.info(f"{symbol} price-vwap {abs(price-candidate['vwap']):.4f} too far")
             return None
 
-    # Submit market buy
-    order = submit_market_order(symbol, qty, "BUY")
-    if not order:
-        logging.error(f"Buy order failed for {symbol}")
+    buy_order = submit_market_order(symbol, qty, "BUY")
+    if not buy_order:
+        logging.error(f"Buy order failed {symbol}")
         return None
-    # attempt to get filled price
-    entry_price = get_filled_price_from_order(order) or price
+
+    entry_price = get_filled_price_from_order(buy_order) or price
     logging.info(f"{symbol} buy filled at {entry_price:.4f}")
-    # monitor and exit
-    trade = monitor_and_exit(symbol, qty, entry_price, tp_price, sl_price)
-    return trade
+    return monitor_and_exit(symbol, qty, entry_price, tp_price, sl_price)
 
 # -------------------------
 # Orchestrator
 # -------------------------
 def main():
     logging.info(f"Run start ET {now_et().isoformat()}")
-    candidates = choose_best_candidate(SYMBOLS)
+    candidates = choose_best_candidates(SYMBOLS)
     if candidates:
         top = candidates[0]
-        logging.info(f"Top candidate: {top['symbol']} score {top['combined_score']:.4f} vwap_score {top['vwap_score']:.3f} vol_score {top['volume_score']:.3f} spread_score {top['spread_score']:.3f}")
-        # Try execute top candidate normally
+        logging.info(f"Top candidate: {top['symbol']} score {top['combined_score']:.4f} (vwap {top['vwap_score']:.3f} vol {top['volume_score']:.3f} spread {top['spread_score']:.3f})")
         trade = execute_candidate(top, force=False)
         if trade:
-            logging.info("Primary trade executed successfully.")
+            logging.info("Primary trade executed.")
             return
-        # If not executed, try next candidates
-        for cand in candidates[1:3]:  # attempt next two candidates
+        # try next two
+        for cand in candidates[1:3]:
             trade = execute_candidate(cand, force=False)
             if trade:
-                logging.info("Primary trade executed on a lower-ranked candidate.")
+                logging.info("Trade executed on lower-ranked candidate.")
                 return
 
-    # If we reach here, no candidate executed
-    # If time passed fallback threshold, try sheet signals
-    current_et_hour = now_et().hour
-    if current_et_hour >= FALLBACK_TIME_ET:
+    # fallback sheet if after time threshold
+    if now_et().hour >= FALLBACK_TIME_ET:
         logging.info("Checking fallback sheet signals")
         signals = fetch_signals_from_sheet(SIGNAL_SHEET_CSV_URL)
         for sig in signals:
@@ -452,17 +444,14 @@ def main():
                 symbol = str(sig.get("symbol","")).upper()
                 action = str(sig.get("action","BUY")).upper()
                 qty = int(sig.get("qty", 1))
-                # allow optional TP/SL in sheet (absolute price or percent)
-                tp_val = sig.get("take_profit", "")
-                sl_val = sig.get("stop_loss", "")
-                # if values look like percent (e.g., 0.5%), handle else ignore
                 order = submit_market_order(symbol, qty, action)
                 if not order:
                     continue
                 entry = get_filled_price_from_order(order) or 0.0
-                # interpret tp/sl: if provided as numeric > 1 assume absolute price; if between 0 and 1 assume pct
                 tp_price = entry * (1 + DEFAULT_TP_PCT)
                 sl_price = entry * (1 - DEFAULT_SL_PCT)
+                tp_val = sig.get("take_profit", "")
+                sl_val = sig.get("stop_loss", "")
                 try:
                     if tp_val not in [None, ""]:
                         tp_num = float(tp_val)
@@ -481,18 +470,16 @@ def main():
                             sl_price = sl_num
                 except Exception:
                     pass
-                # monitor & exit
                 monitor_and_exit(symbol, qty, entry, tp_price, sl_price)
                 logging.info(f"Executed sheet signal for {symbol}")
                 return
             except Exception as e:
                 logging.error(f"Error executing sheet signal: {e}")
 
-    # If still no trade and guarantee is enabled, force top-ranked candidate
+    # guarantee trade if enabled
     if GUARANTEE_ONE_TRADE_PER_DAY and candidates:
         logging.info("No primary/sheet trade executed; forcing top-ranked candidate due to guarantee flag.")
-        forced = execute_candidate(candidates[0], force=True)
-        if forced:
+        if execute_candidate(candidates[0], force=True):
             logging.info("Forced trade executed.")
             return
 
