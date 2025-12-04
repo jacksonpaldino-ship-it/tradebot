@@ -2,36 +2,29 @@ name: Daily Trade Bot
 
 on:
   schedule:
-    # Run every weekday at 09:30 AM ET (market open)
-    - cron: '30 14 * * 1-5'
-  workflow_dispatch: # allows manual triggering
+    - cron: "* * * * *"   # run every minute
+  workflow_dispatch:
 
 jobs:
-  run-tradebot:
+  trade:
     runs-on: ubuntu-latest
 
     steps:
-      # Step 1: Checkout repo
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      # Step 2: Set up Python
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      # Step 3: Install dependencies
-      - name: Install dependencies
+      - name: Install requirements
         run: |
-          python -m pip install --upgrade pip
-          pip install pandas alpaca-trade-api
+          pip install alpaca_trade_api requests
 
-      # Step 4: Run the tradebot
-      - name: Run Hybrid Trade Bot
+      - name: Run bot
         env:
-          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
-          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-          ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
-        run: |
-          python hybrid_tradebot_spy_signals.py
+          APCA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY }}
+          APCA_API_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          APCA_API_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
+        run: python hybrid_tradebot_spy_signals.py
