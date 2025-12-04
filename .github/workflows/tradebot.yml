@@ -1,12 +1,12 @@
-name: Daily Trade Bot
+name: Hybrid TradeBot
 
 on:
   schedule:
-    - cron: "* * * * *"   # run every minute
+    - cron: "*/15 13-20 * * 1-5"   # every 15 minutes, 8:00–15:00 ET
   workflow_dispatch:
 
 jobs:
-  trade:
+  run-bot:
     runs-on: ubuntu-latest
 
     steps:
@@ -18,13 +18,16 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install requirements
+      - name: Install dependencies
         run: |
-          pip install alpaca_trade_api requests
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests alpaca-trade-api
 
-      - name: Run bot
+      - name: Run Hybrid TradeBot
         env:
-          APCA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY }}
-          APCA_API_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-          APCA_API_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
-        run: python hybrid_tradebot_spy_signals.py
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
+        run: |
+          echo "Running bot..."
+          python hybrid_tradebot_spy_signals.py
