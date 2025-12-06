@@ -1,4 +1,4 @@
- name: Trade Bot
+name: Trade Bot
 
 on:
   schedule:
