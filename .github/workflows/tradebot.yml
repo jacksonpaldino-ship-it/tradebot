@@ -1,32 +1,34 @@
-name: Trade Bot
+ name: Trade Bot
 
 on:
   schedule:
-    - cron: "*/10 13-20 * * 1-5"   # Every 10 minutes, only during market hours (13:00–20:59 UTC)
-  workflow_dispatch:                # Manual run button
+    - cron: "*/10 * * * *"     # Every 10 minutes
+  workflow_dispatch:           # Allow manual runs
 
 jobs:
-  run:
+  run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 4         # Prevent hangs
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install requirements
-        run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Run bot
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-          ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
-
+          ALPACA_PAPER: "true"
         run: |
           echo "Start $(TZ='America/New_York' date)"
           python hybrid_tradebot_spy_signals.py
