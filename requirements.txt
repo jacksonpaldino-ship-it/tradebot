@@ -1,4 +1,6 @@
-alpaca-py
+alpaca-trade-api
 yfinance
 pandas
 numpy
+requests
+pytz
