@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Hybrid tradebot with:
-- MACD + VWAP confirmation for buys (keeps your original buy logic)
-- ATR-based conservative position sizing (Option A: 0.5% equity risk)
-- Trailing stop based on ATR (ratchets upward)
-- Guaranteed 1 entry per market day (persisted)
-- Runs safely during market open, robust data fetch, bracket fallback
-- Uses secrets: ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL
+Hybrid tradebot:
+- VWAP + MACD confirmation for buys (keeps your buy logic)
+- ATR-based conservative sizing (0.5% equity risk)
+- Trailing ATR stop (ratchets up)
+- Attempts bracket orders, falls back to manual monitoring
+- Guarantees 1 trade per market day (persisted)
+- Uses alpaca-trade-api, secrets: ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL
 """
 
 import os
@@ -22,33 +22,29 @@ import numpy as np
 import pandas as pd
 from alpaca_trade_api.rest import REST, TimeFrame, APIError
 
-# -------- CONFIG --------
+# ---------------- CONFIG ----------------
 SYMBOLS = ["SPY", "QQQ", "IWM", "DIA"]
 TRADE_LOG_CSV = "trades.csv"
 STATS_JSON = "trade_stats.json"
 TRADED_DAY_FILE = "traded_day.json"
 
-# Risk sizing Option A (conservative)
-RISK_PER_TRADE = 0.005   # 0.5% of equity
+RISK_PER_TRADE = 0.005   # 0.5% equity per trade (conservative)
 ATR_PERIOD = 14
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
 
-# Trailing stop parameters
-ATR_TRAIL_MULT = 1.0     # trail stop at price - ATR*ATR_TRAIL_MULT, ratchets up
-MIN_SL_PCT = 0.002       # floor minimal per-share risk (0.2%)
+ATR_TRAIL_MULT = 1.0     # trailing stop multiplier (ATR)
+MIN_SL_PCT = 0.002       # minimal SL as 0.2% of price
 
-# Buy logic thresholds (preserve yours, can tune)
-VWAP_MAX_PCT = 0.02      # allow up to 2% relative gap for initial scoring (adaptive used below)
-MIN_VOLUME = 30000
+VWAP_MAX_PCT = 0.02      # for scoring normalization
+MIN_VOLUME = 30000       # minimum volume threshold
 
-# Behavior
 GUARANTEE_TRADE = True
-MONITOR_INTERVAL = 5     # seconds between price checks after entry
-MONITOR_TIMEOUT = 60*45  # 45 minutes max monitoring before forced exit
+MONITOR_INTERVAL = 5     # seconds
+MONITOR_TIMEOUT = 60 * 45
 
-# Secrets (your current secret names)
+# ---------------- SECRETS ----------------
 API_KEY = os.getenv("ALPACA_API_KEY")
 API_SECRET = os.getenv("ALPACA_SECRET_KEY")
 BASE_URL = os.getenv("ALPACA_BASE_URL")
@@ -56,12 +52,13 @@ BASE_URL = os.getenv("ALPACA_BASE_URL")
 if not (API_KEY and API_SECRET and BASE_URL):
     raise RuntimeError("Missing Alpaca credentials. Set ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL")
 
+# Alpaca client
 api = REST(API_KEY, API_SECRET, BASE_URL)
 
 TZ = pytz.timezone("US/Eastern")
 EPS = 1e-9
 
-# -------- Utilities --------
+# ---------------- Utilities ----------------
 def now_et():
     return datetime.now(TZ)
 
@@ -100,25 +97,22 @@ def update_stats(tr):
     stats[tr["symbol"]] = s
     save_json(STATS_JSON, stats)
 
-# -------- Data fetching (robust) --------
+# ---------------- Data fetch ----------------
 def safe_get_bars(symbol, limit=200):
     try:
         bars = api.get_bars(symbol, TimeFrame.Minute, limit=limit, adjustment='raw').df
         if bars is None or bars.empty:
             return None
-        # when single-symbol fetch, sometimes no 'symbol' column
         if "symbol" not in bars.columns:
             bars["symbol"] = symbol
-        # ensure chronological index
         bars = bars.sort_index()
         return bars
     except Exception as e:
         print(f"safe_get_bars error {symbol}: {e}")
         return None
 
-# -------- Indicators: ATR, MACD, VWAP --------
+# ---------------- Indicators ----------------
 def compute_atr(df, period=ATR_PERIOD):
-    # df must have high/low/close
     high = df["high"]
     low = df["low"]
     close = df["close"]
@@ -143,12 +137,11 @@ def compute_macd(df):
     hist = macd - signal
     return macd.iloc[-1], signal.iloc[-1], hist.iloc[-1]
 
-# -------- Scoring / BUY logic (your current logic + MACD confirmation) --------
+# ---------------- Scoring & buy checks ----------------
 def score_and_check(symbol):
     df = safe_get_bars(symbol, limit=200)
     if df is None or df.empty:
         return None
-    # use last window for VWAP/vol/spread
     window = min(120, len(df))
     dfw = df.tail(window)
     price = float(dfw["close"].iloc[-1])
@@ -157,19 +150,15 @@ def score_and_check(symbol):
     high = float(dfw["high"].iloc[-1])
     low = float(dfw["low"].iloc[-1])
     spread = max(high - low, EPS)
-    # adaptive measures
     spread_avg = float((dfw["high"] - dfw["low"]).mean()) if len(dfw) > 1 else spread
     vol_avg = float(dfw["volume"].mean()) if len(dfw) > 1 else volume
-    # scoring components (keep your weights)
     vw_gap = abs(price - vwap) / (vwap + EPS)
-    vw_score = max(0.0, 1.0 - vw_gap / (VWAP_MAX_PCT + EPS))  # normalized
+    vw_score = max(0.0, 1.0 - vw_gap / (VWAP_MAX_PCT + EPS))
     vol_score = min(1.0, volume / (vol_avg + EPS))
     spread_score = max(0.0, 1.0 - (spread / (spread_avg + EPS)))
     base_score = 0.45*vw_score + 0.35*vol_score + 0.20*spread_score
-    # MACD confirmation: require MACD histogram > 0 (momentum)
     macd_val, macd_signal, macd_hist = compute_macd(dfw)
     macd_ok = macd_hist > 0
-    # filter checks: minimum volume
     if volume < MIN_VOLUME:
         return None
     return {
@@ -186,7 +175,7 @@ def score_and_check(symbol):
         "atr": compute_atr(dfw)
     }
 
-# -------- Position sizing (ATR-based, conservative) --------
+# ---------------- Sizing ----------------
 def get_account_equity():
     try:
         acct = api.get_account()
@@ -200,12 +189,11 @@ def compute_qty(entry_price, atr):
     if equity is None or equity <= 0:
         return 1
     risk_amount = equity * RISK_PER_TRADE
-    # estimated per-share risk : max(ATR, minimal percent of price)
     per_share_risk = max(atr, entry_price * MIN_SL_PCT)
     qty = int(max(1, math.floor(risk_amount / (per_share_risk + EPS))))
     return qty
 
-# -------- Order helpers --------
+# ---------------- Orders ----------------
 def submit_market_order(symbol, qty, side="buy"):
     try:
         order = api.submit_order(symbol=symbol, qty=qty, side=side, type="market", time_in_force="day")
@@ -234,19 +222,12 @@ def submit_bracket_buy(symbol, qty, sl_price, tp_price):
         print(f"submit_bracket_buy failed: {e}")
         return None
 
-# -------- Monitoring with trailing stop --------
+# ---------------- Trailing monitor ----------------
 def monitor_trailing(symbol, entry_price, qty, atr, initial_sl_price):
-    """
-    Trailing stop logic:
-    - initial SL: entry_price - ATR*ATR_TRAIL_MULT (or initial_sl_price)
-    - trailing_stop = max(prev_stop, current_price - ATR*ATR_TRAIL_MULT)
-    - enforce exit when current_price <= trailing_stop
-    """
     trail_stop = initial_sl_price
     start = time.time()
     print(f"Start monitoring {symbol} entry={entry_price:.6f} initial_sl={initial_sl_price:.6f} qty={qty}")
     while True:
-        # timeout guard
         if time.time() - start > MONITOR_TIMEOUT:
             print("Monitor timeout — forcing market exit")
             sell = submit_market_order(symbol, qty, side="sell")
@@ -257,7 +238,6 @@ def monitor_trailing(symbol, entry_price, qty, atr, initial_sl_price):
                     exit_price = float(getattr(o, "filled_avg_price", None)) or None
                 except Exception:
                     pass
-            # fallback last price
             if exit_price is None:
                 bars = safe_get_bars(symbol, limit=1)
                 exit_price = float(bars["close"].iloc[-1]) if bars is not None else None
@@ -265,21 +245,16 @@ def monitor_trailing(symbol, entry_price, qty, atr, initial_sl_price):
             record_trade(symbol, qty, entry_price, exit_price, pnl, "TIMEOUT")
             return
 
-        # get latest price
         bars = safe_get_bars(symbol, limit=3)
         if bars is None:
             time.sleep(MONITOR_INTERVAL)
             continue
         last_price = float(bars["close"].iloc[-1])
-
-        # recompute ATR short window to adapt
         recent_atr = compute_atr(bars) or atr
         candidate_trail = last_price - recent_atr * ATR_TRAIL_MULT
-        # trail only moves up (for long)
         if candidate_trail > trail_stop:
             trail_stop = candidate_trail
 
-        # check exit conditions
         if last_price <= trail_stop:
             print(f"Trailing SL hit for {symbol} at {last_price:.6f} trail_stop={trail_stop:.6f}")
             sell = submit_market_order(symbol, qty, side="sell")
@@ -296,7 +271,6 @@ def monitor_trailing(symbol, entry_price, qty, atr, initial_sl_price):
             record_trade(symbol, qty, entry_price, exit_price, pnl, "TRAIL_SL")
             return
 
-        # extra exit: VWAP breakdown
         vwap = compute_vwap(bars.tail(min(len(bars), 60)))
         if last_price < vwap:
             print(f"VWAP breakdown during monitor for {symbol}: price={last_price:.6f} vwap={vwap:.6f}")
@@ -316,7 +290,7 @@ def monitor_trailing(symbol, entry_price, qty, atr, initial_sl_price):
 
         time.sleep(MONITOR_INTERVAL)
 
-# -------- Recording trades --------
+# ---------------- Record ----------------
 def record_trade(symbol, qty, entry, exit_price, pnl, result, notes=""):
     ts = datetime.utcnow().isoformat()
     row = [ts, symbol, "LONG", qty, round(entry,6) if entry is not None else None,
@@ -327,7 +301,7 @@ def record_trade(symbol, qty, entry, exit_price, pnl, result, notes=""):
     update_stats(tr)
     print("Recorded trade:", tr)
 
-# -------- Fallback sheet (optional) --------
+# ---------------- Fallback sheet ----------------
 def fetch_sheet_signals():
     url = os.getenv("SIGNAL_SHEET_CSV_URL")
     if not url:
@@ -347,9 +321,8 @@ def fetch_sheet_signals():
         print("fetch_sheet_signals error:", e)
         return []
 
-# -------- Main run (guarantee 1 trade/day) --------
+# ---------------- Run once (guarantee 1/day) ----------------
 def run_once():
-    # check market open
     try:
         clock = api.get_clock()
         if not getattr(clock, "is_open", False):
@@ -365,21 +338,18 @@ def run_once():
         print("Already traded today (guarantee). Exiting.")
         return None
 
-    # score symbols
     scored = []
     for s in SYMBOLS:
         try:
             info = score_and_check(s)
             if info is None:
                 continue
-            # require MACD positive
             if not info["macd_ok"]:
                 continue
             scored.append(info)
         except Exception as e:
             print(f"score error {s}: {e}")
 
-    # fallback to sheet if none
     if not scored:
         print("No primary candidates found; trying sheet fallback.")
         sheet = fetch_sheet_signals()
@@ -402,19 +372,16 @@ def run_once():
                 except Exception:
                     entry_price = price
                 sl = entry_price - max(atr, entry_price * MIN_SL_PCT)
-                # start monitor trailing (manual)
                 monitor_trailing(sym, entry_price, qty, atr, sl)
                 traded["date"] = today
                 save_json(TRADED_DAY_FILE, traded)
                 return True
         return None
 
-    # rank
     scored.sort(key=lambda x: x["score"], reverse=True)
     top = scored[0]
     print(f"Top candidate: {top['symbol']} score {top['score']:.4f} price {top['price']:.4f} macd_hist {top['macd_hist']:.6f}")
 
-    # acceptance filter (adaptive)
     vw_gap_pct = abs(top["price"] - top["vwap"]) / (top["vwap"] + EPS)
     adaptive_limit = max(0.005, (top["spread_avg"] / (top["vwap"] + EPS)) * 1.2)
     if vw_gap_pct > adaptive_limit:
@@ -423,28 +390,22 @@ def run_once():
             return None
         print("Guarantee ON — forcing top candidate")
 
-    # compute sizing
     atr = top["atr"]
     sl_price = top["price"] - max(atr, top["price"] * MIN_SL_PCT)
     qty = compute_qty(top["price"], atr)
     if qty < 1:
         qty = 1
 
-    # attempt bracket order first
     tp_price = top["price"] + (top["price"] - sl_price) * 1.5
     bracket = submit_bracket_buy(top["symbol"], qty, sl_price, tp_price)
     entry_price = None
-    bracket_used = False
     if bracket:
-        bracket_used = True
-        # try to read filled price
         try:
             o = api.get_order(bracket.id)
             entry_price = float(getattr(o, "filled_avg_price", None)) or None
         except Exception:
             entry_price = None
     else:
-        # market buy fallback
         order = submit_market_order(top["symbol"], qty, "buy")
         if not order:
             print("Buy failed; aborting run.")
@@ -458,13 +419,12 @@ def run_once():
             bars = safe_get_bars(top["symbol"], limit=1)
             entry_price = float(bars["close"].iloc[-1]) if bars is not None else top["price"]
 
-    # start trailing monitoring (if bracket_used, monitoring will still detect position closed)
     monitor_trailing(top["symbol"], entry_price, qty, atr, sl_price)
     traded["date"] = today
     save_json(TRADED_DAY_FILE, traded)
     return True
 
-# -------- ENTRYPOINT --------
+# ---------------- Entrypoint ----------------
 if __name__ == "__main__":
     print("Run start ET", now_et().isoformat())
     try:
