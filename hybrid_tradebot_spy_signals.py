@@ -16,6 +16,7 @@ import csv
 import json
 from datetime import datetime, timedelta
 import pytz
+import requests
 
 import numpy as np
 import pandas as pd
@@ -147,7 +148,7 @@ def score_and_check(symbol):
     df = safe_get_bars(symbol, limit=200)
     if df is None or df.empty:
         return None
-    # use last 60 minutes window for VWAP/vol/spread
+    # use last window for VWAP/vol/spread
     window = min(120, len(df))
     dfw = df.tail(window)
     price = float(dfw["close"].iloc[-1])
@@ -161,15 +162,15 @@ def score_and_check(symbol):
     vol_avg = float(dfw["volume"].mean()) if len(dfw) > 1 else volume
     # scoring components (keep your weights)
     vw_gap = abs(price - vwap) / (vwap + EPS)
-    vw_score = max(0.0, 1.0 - vw_gap / (0.02 + EPS))  # normalized by 2% default
+    vw_score = max(0.0, 1.0 - vw_gap / (VWAP_MAX_PCT + EPS))  # normalized
     vol_score = min(1.0, volume / (vol_avg + EPS))
     spread_score = max(0.0, 1.0 - (spread / (spread_avg + EPS)))
     base_score = 0.45*vw_score + 0.35*vol_score + 0.20*spread_score
     # MACD confirmation: require MACD histogram > 0 (momentum)
     macd_val, macd_signal, macd_hist = compute_macd(dfw)
     macd_ok = macd_hist > 0
-    # filter checks
-    if volume < MIN_VOLUME := MIN_VOLUME if (MIN_VOLUME := 30000) else 30000:
+    # filter checks: minimum volume
+    if volume < MIN_VOLUME:
         return None
     return {
         "symbol": symbol,
@@ -196,7 +197,7 @@ def get_account_equity():
 
 def compute_qty(entry_price, atr):
     equity = get_account_equity()
-    if equity is None:
+    if equity is None or equity <= 0:
         return 1
     risk_amount = equity * RISK_PER_TRADE
     # estimated per-share risk : max(ATR, minimal percent of price)
@@ -347,22 +348,6 @@ def fetch_sheet_signals():
         return []
 
 # -------- Main run (guarantee 1 trade/day) --------
-def safe_get_bars(symbol, limit=200):
-    return safe_get_bars_impl(symbol, limit)
-
-def safe_get_bars_impl(symbol, limit=200):
-    try:
-        bars = api.get_bars(symbol, TimeFrame.Minute, limit=limit, adjustment='raw').df
-        if bars is None or bars.empty:
-            return None
-        if "symbol" not in bars.columns:
-            bars["symbol"] = symbol
-        bars = bars.sort_index()
-        return bars
-    except Exception as e:
-        print(f"safe_get_bars_impl error {symbol}: {e}")
-        return None
-
 def run_once():
     # check market open
     try:
