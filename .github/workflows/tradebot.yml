@@ -1,9 +1,9 @@
-name: Trade Bot
+name: Trade Bot (every 10m during market hours)
 
 on:
   schedule:
-    - cron: "*/10 13-20 * * 1-5"   # Every 10 minutes during UTC 13:00–20:59 (covers US market hours)
-  workflow_dispatch:               # Manual run
+    - cron: "*/10 13-20 * * 1-5"   # every 10 minutes UTC 13:00–20:59 => covers US market hours
+  workflow_dispatch:
 
 jobs:
   run-bot:
@@ -11,7 +11,7 @@ jobs:
     timeout-minutes: 8
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python
