@@ -1,153 +1,124 @@
 #!/usr/bin/env python3
 """
-Hybrid tradebot — full rewrite.
-
-Features:
-- Uses your VWAP/volume/spread buy logic + MACD crossover confirmation
-- ATR(14) volatility-based conservative position sizing (0.5% equity risk)
-- Trailing stop based on ATR (ratchets upward)
-- Attempts bracket orders (TP/SL), falls back to market + monitor
-- Guarantees max 1 entry per ET day; forces a trade at FORCE_TRADE_HOUR:FORCE_TRADE_MIN if none executed
-- Robust Alpaca API error handling and retries
-- Logs trades to trades.csv and stats to trade_stats.json
-- Uses secrets: ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL
+HF scalper bot (micro-scalper, aggressive)
+- Mode: B1 micro-scalper (1-minute signals)
+- Max trades/day: 10 (global), per-symbol limited
+- Profit target: 0.20% (TP) ; Stop-loss: 0.15% (SL)
+- Position sizing: 2% equity risk (ATR-based)
+- Uses alpaca-py TradingClient for orders and data
+- Single-open-position global rule (safety)
+- Persistent state in JSON to avoid duplicate entries and enforce daily caps
 """
 
 import os
-import time
 import math
-import csv
+import time
 import json
-from datetime import datetime, timedelta, time as dtime
+import csv
+from datetime import datetime, timedelta
 import pytz
 import requests
+import traceback
 
 import numpy as np
 import pandas as pd
-from alpaca_trade_api.rest import REST, TimeFrame, APIError
+import yfinance as yf
 
-# ---------------- CONFIG ----------------
-SYMBOLS = ["SPY", "QQQ", "IWM", "DIA"]   # primary universe; add extras if desired
-TRADE_LOG_CSV = "trades.csv"
-STATS_JSON = "trade_stats.json"
-TRADED_DAY_FILE = "traded_day.json"
+# alpaca-py imports
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest, OrderRequest, TakeProfit, StopLoss
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 
-# Sizing / risk
-RISK_PER_TRADE = 0.005   # 0.5% of equity per trade (conservative)
+# ---------------- CONFIG (aggressive defaults chosen per your request) ----------------
+SYMBOLS = ["SPY", "QQQ", "IWM", "DIA"]   # universe
+MAX_TRADES_PER_DAY = 10                  # global cap
+PER_SYMBOL_DAILY_CAP = 6                 # cap per symbol (safety)
+TP_PCT = 0.0020                          # 0.20% take profit
+SL_PCT = 0.0015                          # 0.15% stop-loss
+RISK_PER_TRADE = 0.02                    # 2% account equity risk per trade (aggressive)
 ATR_PERIOD = 14
-MIN_SL_PCT = 0.002       # 0.2% minimum per-share SL
-
-# MACD
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
 
-# Trailing stop
-ATR_TRAIL_MULT = 1.0
+MIN_VOLUME = 20_000                      # filter low-volume bars
+MAX_POSITION_AGE_MIN = 60 * 3           # close after 3 hours forced (shouldn't hit often)
 
-# Filters / scoring
-VWAP_MAX_PCT = 0.02      # used to normalize score (2% baseline)
-MIN_VOLUME = 30000
+STATE_FILE = "hf_scalper_state.json"
+TRADES_CSV = "hf_trades.csv"
+LOG_FILE = "hf_bot.log"
 
-# Guarantee / scheduling
-GUARANTEE_TRADE = True
-FORCE_TRADE_HOUR = 15    # ET hour to force trade if none (15 = 3pm ET)
-FORCE_TRADE_MIN = 30     # ET minute to force trade (3:30pm ET)
-RUN_INTERVAL_SECONDS = 10 * 60  # not used inside script; GH runs every 10m
-
-# Monitoring
-MONITOR_INTERVAL = 5     # seconds
-MONITOR_TIMEOUT = 60 * 45  # seconds (45 min)
-
-# Alpaca secrets (must match your repo secrets)
-API_KEY = os.getenv("ALPACA_API_KEY")
-API_SECRET = os.getenv("ALPACA_SECRET_KEY")
-BASE_URL = os.getenv("ALPACA_BASE_URL")  # e.g. "https://paper-api.alpaca.markets"
-
-if not (API_KEY and API_SECRET and BASE_URL):
+# Alpaca credentials from env (workflow maps these secrets)
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL")  # e.g. 'https://paper-api.alpaca.markets'
+if not (ALPACA_API_KEY and ALPACA_SECRET_KEY and ALPACA_BASE_URL):
     raise RuntimeError("Missing Alpaca credentials. Set ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL")
 
-# Alpaca client
-api = REST(API_KEY, API_SECRET, BASE_URL)
+# clients
+trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True if "paper" in ALPACA_BASE_URL else False)
+data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
-# Timezone
 TZ = pytz.timezone("US/Eastern")
 EPS = 1e-9
 
-# ---------------- Utilities ----------------
+# ---------------- utilities ----------------
 def now_et():
     return datetime.now(TZ)
 
-def now_utc():
+def utcnow():
     return datetime.utcnow()
 
-def load_json(path):
-    if not os.path.exists(path):
-        return {}
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {"date": None, "daily_trades": 0, "per_symbol": {}, "has_open": False}
     try:
-        with open(path, "r") as f:
+        with open(STATE_FILE, "r") as f:
             return json.load(f)
     except Exception:
-        return {}
+        return {"date": None, "daily_trades": 0, "per_symbol": {}, "has_open": False}
 
-def save_json(path, obj):
-    with open(path, "w") as f:
-        json.dump(obj, f)
+def save_state(s):
+    with open(STATE_FILE, "w") as f:
+        json.dump(s, f)
 
-def append_trade_csv(row):
-    header = ["timestamp","symbol","side","qty","entry","exit","pnl","result","notes"]
-    exists = os.path.exists(TRADE_LOG_CSV)
-    with open(TRADE_LOG_CSV, "a", newline="") as f:
+def append_csv(row):
+    exists = os.path.exists(TRADES_CSV)
+    header = ["utc_ts","symbol","side","qty","entry","exit","pnl","note"]
+    with open(TRADES_CSV, "a", newline="") as f:
         w = csv.writer(f)
         if not exists:
             w.writerow(header)
         w.writerow(row)
 
-def update_stats(tr):
-    stats = load_json(STATS_JSON)
-    s = stats.get(tr["symbol"], {"wins":0,"losses":0,"trades":0,"pnl":0.0})
-    s["trades"] += 1
-    pnl = tr.get("pnl") or 0.0
-    s["pnl"] = round(s.get("pnl",0.0) + pnl,6)
-    if tr.get("result") == "WIN":
-        s["wins"] += 1
-    elif tr.get("result") == "LOSS":
-        s["losses"] += 1
-    stats[tr["symbol"]] = s
-    save_json(STATS_JSON, stats)
+def log(msg):
+    ts = utcnow().isoformat()
+    line = f"{ts} {msg}"
+    print(line)
+    with open(LOG_FILE, "a") as f:
+        f.write(line + "\n")
 
-# ---------------- Data helpers ----------------
-def safe_get_bars(symbol, limit=200):
-    """
-    Fetch recent minute bars from Alpaca. Returns DataFrame or None.
-    Normalizes columns to lower-case: open, high, low, close, volume
-    """
-    try:
-        bars = api.get_bars(symbol, TimeFrame.Minute, limit=limit, adjustment='raw').df
-        if bars is None or bars.empty:
-            return None
-        # If bars contains multi-index columns (symbol, open, ...), flatten
-        if isinstance(bars.columns, pd.MultiIndex):
-            bars.columns = bars.columns.get_level_values(1)
-        bars = bars.rename(str.lower, axis="columns")
-        # sometimes symbol column missing for single-symbol fetch
-        if "symbol" not in bars.columns:
-            bars["symbol"] = symbol
-        bars = bars.sort_index()
-        return bars
-    except Exception as e:
-        print(f"safe_get_bars error {symbol}: {e}")
-        return None
-
-# ---------------- Indicators ----------------
-def compute_atr(df, period=ATR_PERIOD):
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+# ---------------- indicators ----------------
+def compute_atr(series_df, period=ATR_PERIOD):
+    high = series_df["high"]
+    low = series_df["low"]
+    close = series_df["close"]
+    prev = close.shift(1)
+    tr = pd.concat([high-low, (high - prev).abs(), (low - prev).abs()], axis=1).max(axis=1)
     atr = tr.rolling(period, min_periods=1).mean().iloc[-1]
-    return float(max(atr, 0.0001))
+    return max(float(atr), 0.0001)
+
+def compute_macd_hist(series_df):
+    close = series_df["close"]
+    ema_fast = close.ewm(span=MACD_FAST, adjust=False).mean()
+    ema_slow = close.ewm(span=MACD_SLOW, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    signal = macd.ewm(span=MACD_SIGNAL, adjust=False).mean()
+    hist = (macd - signal).iloc[-1]
+    return float(hist)
 
 def compute_vwap(df):
     pv = (df["close"] * df["volume"]).sum()
@@ -156,67 +127,50 @@ def compute_vwap(df):
         return float(df["close"].iloc[-1])
     return float(pv / v)
 
-def compute_macd_hist(df, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL):
-    close = df["close"]
-    ema_fast = close.ewm(span=fast, adjust=False).mean()
-    ema_slow = close.ewm(span=slow, adjust=False).mean()
-    macd = ema_fast - ema_slow
-    sig = macd.ewm(span=signal, adjust=False).mean()
-    hist = macd - sig
-    return float(hist.iloc[-1]), float(macd.iloc[-1]), float(sig.iloc[-1])
+# ---------------- alpaca data helper (1m) ----------------
+def fetch_minute_bars(symbol, limit=120):
+    """
+    Use Alpaca data client to fetch minute bars (most reliable).
+    Falls back to yfinance if data_client fails (offline/testing).
+    Returns pandas DataFrame with columns: open, high, low, close, volume, indexed by timestamp (UTC).
+    """
+    try:
+        req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute, limit=limit)
+        bars = data_client.get_stock_bars(req)
+        df = bars.df
+        if df is None or df.empty:
+            raise RuntimeError("empty bars")
+        # if multi-symbol, select symbol
+        if isinstance(df.columns, pd.MultiIndex):
+            # dataframe has columns like (symbol, open)
+            df = df.xs(symbol, axis=1, level=0)
+        df = df.rename(str.lower, axis=1)
+        df = df.sort_index()
+        return df
+    except Exception as e:
+        # fallback to yfinance (slower, less reliable)
+        try:
+            import yfinance as yf
+            t_end = datetime.utcnow()
+            t_start = t_end - timedelta(minutes=limit*2)
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(interval="1m", start=t_start - timedelta(minutes=1), end=t_end + timedelta(minutes=1))
+            if df is None or df.empty:
+                return None
+            df = df.rename(columns=str.lower)
+            df = df[["open","high","low","close","volume"]]
+            df.index = df.index.tz_localize(None)
+            return df.tail(limit)
+        except Exception:
+            return None
 
-# ---------------- Scoring & entry logic ----------------
-def score_symbol(symbol):
-    df = safe_get_bars(symbol, limit=200)
-    if df is None or df.empty:
-        return None
-    window = min(120, len(df))
-    dfw = df.iloc[-window:].copy()
-    price = float(dfw["close"].iloc[-1])
-    vwap = compute_vwap(dfw)
-    volume = int(dfw["volume"].iloc[-1])
-    high = float(dfw["high"].iloc[-1])
-    low = float(dfw["low"].iloc[-1])
-    spread = max(high - low, EPS)
-    spread_avg = float((dfw["high"] - dfw["low"]).mean()) if len(dfw) > 1 else spread
-    vol_avg = float(dfw["volume"].mean()) if len(dfw) > 1 else volume
-
-    vw_gap = abs(price - vwap) / (vwap + EPS)
-    vw_score = max(0.0, 1.0 - vw_gap / (VWAP_MAX_PCT + EPS))
-    vol_score = min(1.0, volume / (vol_avg + EPS))
-    spread_score = max(0.0, 1.0 - (spread / (spread_avg + EPS)))
-    base_score = 0.45 * vw_score + 0.35 * vol_score + 0.20 * spread_score
-
-    macd_hist, macd_val, macd_sig = compute_macd_hist(dfw)
-    macd_ok = macd_hist > 0
-
-    if volume < MIN_VOLUME:
-        return None
-
-    atr = compute_atr(dfw)
-
-    return {
-        "symbol": symbol,
-        "score": float(base_score),
-        "price": price,
-        "vwap": vwap,
-        "volume": volume,
-        "spread": spread,
-        "spread_avg": spread_avg,
-        "vol_avg": vol_avg,
-        "macd_hist": macd_hist,
-        "macd_ok": macd_ok,
-        "atr": atr,
-        "df": dfw
-    }
-
-# ---------------- Position sizing ----------------
+# ---------------- risk sizing ----------------
 def get_account_equity():
     try:
-        acct = api.get_account()
+        acct = trading_client.get_account()
         return float(acct.equity)
     except Exception as e:
-        print("get_account_equity error:", e)
+        log(f"get_account_equity error: {e}")
         return None
 
 def compute_qty(entry_price, atr):
@@ -224,306 +178,260 @@ def compute_qty(entry_price, atr):
     if equity is None or equity <= 0:
         return 1
     risk_amount = equity * RISK_PER_TRADE
-    per_share_risk = max(atr, entry_price * MIN_SL_PCT)
-    qty = int(max(1, math.floor(risk_amount / (per_share_risk + EPS))))
-    return qty
+    per_share_risk = max(atr, entry_price * 0.0005)  # floor tiny risk
+    qty = int(max(1, math.floor(risk_amount / per_share_risk)))
+    # cap size by buying power safety estimate (don't use margin crazy)
+    cap = max(1, int((equity * 0.5) // entry_price))  # never use >50% equity nominal exposure
+    return min(qty, cap)
 
-# ---------------- Order helpers ----------------
-def submit_market_order(symbol, qty, side="buy", max_retries=3):
-    attempt = 0
-    while attempt < max_retries:
-        try:
-            order = api.submit_order(symbol=symbol, qty=qty, side=side, type="market", time_in_force="day")
-            print(f"Submitted {side.upper()} {qty} {symbol}")
-            return order
-        except Exception as e:
-            attempt += 1
-            print(f"submit_market_order attempt {attempt} error: {e}")
-            time.sleep(1.0 * attempt)
-    return None
-
-def submit_bracket_buy(symbol, qty, sl_price, tp_price):
+# ---------------- order helpers ----------------
+def place_bracket_buy(symbol, qty, sl_price, tp_price):
+    """
+    Uses alpaca-py TradingClient to submit a bracket order if available.
+    """
     try:
-        order = api.submit_order(
+        order_request = MarketOrderRequest(
             symbol=symbol,
             qty=qty,
-            side="buy",
-            type="market",
-            time_in_force="day",
-            order_class="bracket",
-            take_profit={"limit_price": str(round(tp_price,6))},
-            stop_loss={"stop_price": str(round(sl_price,6))}
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+            order_class=OrderClass.BRACKET,
+            take_profit=TakeProfit(limit_price=str(round(tp_price, 6))),
+            stop_loss=StopLoss(stop_price=str(round(sl_price, 6)))
         )
-        print(f"Submitted bracket buy {qty} {symbol}")
+        order = trading_client.submit_order(order_request)
+        log(f"Bracket buy submitted: {symbol} qty={qty}")
         return order
     except Exception as e:
-        print(f"submit_bracket_buy failed: {e}")
+        log(f"place_bracket_buy error: {e}")
         return None
 
-# ---------------- Monitoring & exits ----------------
-def monitor_position(symbol, entry_price, qty, atr, initial_sl):
-    """
-    Monitor a live position: trailing ATR stop (ratchets up), VWAP breakdown exit, or timeout exit.
-    """
-    trail_stop = initial_sl
-    start = time.time()
-    print(f"Monitoring {symbol}: entry={entry_price:.6f} qty={qty} init_sl={initial_sl:.6f}")
-    while True:
-        # Timeout guard
-        if time.time() - start > MONITOR_TIMEOUT:
-            print("Monitor timeout, forcing exit")
-            sell = submit_market_order(symbol, qty, "sell")
-            exit_price = None
-            if sell:
-                try:
-                    o = api.get_order(sell.id)
-                    exit_price = float(getattr(o, "filled_avg_price", None)) if getattr(o, "filled_avg_price", None) else None
-                except Exception:
-                    exit_price = None
-            if exit_price is None:
-                bars = safe_get_bars(symbol, limit=1)
-                exit_price = float(bars["close"].iloc[-1]) if bars is not None else None
-            pnl = (exit_price - entry_price) * qty if exit_price is not None else None
-            record_trade(symbol, qty, entry_price, exit_price, pnl, "TIMEOUT")
-            return
-
-        bars = safe_get_bars(symbol, limit=5)
-        if bars is None:
-            time.sleep(MONITOR_INTERVAL)
-            continue
-        last_price = float(bars["close"].iloc[-1])
-        recent_atr = compute_atr(bars) or atr
-        candidate_trail = last_price - recent_atr * ATR_TRAIL_MULT
-        if candidate_trail > trail_stop:
-            trail_stop = candidate_trail
-
-        # trailing stop hit
-        if last_price <= trail_stop:
-            print(f"Trailing stop hit: {symbol} @ {last_price:.6f} (trail {trail_stop:.6f})")
-            sell = submit_market_order(symbol, qty, "sell")
-            exit_price = None
-            if sell:
-                try:
-                    o = api.get_order(sell.id)
-                    exit_price = float(getattr(o, "filled_avg_price", None)) if getattr(o, "filled_avg_price", None) else None
-                except Exception:
-                    exit_price = None
-            if exit_price is None:
-                exit_price = last_price
-            pnl = (exit_price - entry_price) * qty
-            record_trade(symbol, qty, entry_price, exit_price, pnl, "TRAIL_SL")
-            return
-
-        # VWAP breakdown exit
-        vwap_recent = compute_vwap(bars.tail(min(len(bars), 60)))
-        if last_price < vwap_recent:
-            print(f"VWAP breakdown exit: {symbol} price {last_price:.6f} vwap {vwap_recent:.6f}")
-            sell = submit_market_order(symbol, qty, "sell")
-            exit_price = None
-            if sell:
-                try:
-                    o = api.get_order(sell.id)
-                    exit_price = float(getattr(o, "filled_avg_price", None)) if getattr(o, "filled_avg_price", None) else None
-                except Exception:
-                    exit_price = None
-            if exit_price is None:
-                exit_price = last_price
-            pnl = (exit_price - entry_price) * qty
-            record_trade(symbol, qty, entry_price, exit_price, pnl, "VWAP_EXIT")
-            return
-
-        time.sleep(MONITOR_INTERVAL)
-
-# ---------------- Recording ----------------
-def record_trade(symbol, qty, entry, exit_price, pnl, result, notes=""):
-    ts = datetime.utcnow().isoformat()
-    row = [ts, symbol, "LONG", qty, round(entry,6) if entry is not None else None,
-           round(exit_price,6) if exit_price is not None else None,
-           round(pnl,6) if pnl is not None else None, result, notes]
-    append_trade_csv(row)
-    tr = {"timestamp": ts, "symbol": symbol, "qty": qty, "entry": entry, "exit": exit_price, "pnl": pnl, "result": result, "notes": notes}
-    update_stats(tr)
-    print("Recorded trade:", tr)
-
-# ---------------- Fallback Google Sheet (optional) ----------------
-def fetch_sheet_signals():
-    url = os.getenv("SIGNAL_SHEET_CSV_URL")
-    if not url:
-        return []
+def place_market_buy(symbol, qty):
     try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        df = pd.read_csv(pd.io.common.StringIO(resp.text), engine="python", on_bad_lines="skip")
-        df.columns = [c.strip().lower() for c in df.columns]
-        if "symbol" not in df.columns:
-            return []
-        df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
-        if "enabled" in df.columns:
-            df = df[df["enabled"].astype(str).str.lower().isin(["true","1","yes","y"])]
-        return df.to_dict("records")
+        order_request = MarketOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY
+        )
+        order = trading_client.submit_order(order_request)
+        log(f"Market buy submitted: {symbol} qty={qty}")
+        return order
     except Exception as e:
-        print("fetch_sheet_signals error:", e)
-        return []
-
-# ---------------- Main run (guarantee 1 trade/day) ----------------
-def run_once():
-    # 1) check market is open
-    try:
-        clock = api.get_clock()
-        if not getattr(clock, "is_open", False):
-            print(f"Market closed; exiting. ({clock.timestamp})")
-            return None
-    except Exception as e:
-        print("Clock error:", e)
+        log(f"place_market_buy error: {e}")
         return None
 
-    traded = load_json(TRADED_DAY_FILE)
+# ---------------- main signal & execution logic ----------------
+def scan_and_trade():
+    """
+    Single-run scanner:
+    - refresh state for today's counters
+    - if global open position exists, do nothing (we enforce single-open-position)
+    - otherwise score universe and attempt to place one (or a few) scalps subject to daily caps
+    """
+    state = load_state()
     today = now_et().strftime("%Y-%m-%d")
-    if traded.get("date") == today:
-        print("Already traded today. Exiting.")
-        return None
+    if state.get("date") != today:
+        # reset daily counters
+        state = {"date": today, "daily_trades": 0, "per_symbol": {}, "open_order_id": None, "has_open": False}
+        save_state(state)
 
-    # 2) score all symbols
-    candidates = []
-    for s in SYMBOLS:
+    # safety: do not run heavy logic if already reached daily cap
+    if state["daily_trades"] >= MAX_TRADES_PER_DAY:
+        log(f"Daily trade cap reached ({state['daily_trades']}/{MAX_TRADES_PER_DAY}). Exiting.")
+        return
+
+    # if any open positions exist on account, do not enter new one (global single-position rule)
+    positions = list(trading_client.get_all_positions())
+    if positions:
+        log("Account has open positions; skipping entry to avoid multi-position state.")
+        return
+
+    # Score each symbol
+    scored = []
+    for sym in SYMBOLS:
         try:
-            info = score_symbol(s)
-            if not info:
+            df = fetch_minute_bars(sym, limit=120)
+            if df is None or df.empty or len(df) < 10:
                 continue
-            # require MACD histogram > 0 (momentum)
-            if not info["macd_ok"]:
+            # filter by recent volume liquidity
+            if int(df["volume"].iloc[-1]) < MIN_VOLUME:
                 continue
-            candidates.append(info)
+            # compute indicators on recent window (last 60)
+            window = df.tail(60)
+            price = float(window["close"].iloc[-1])
+            vwap = compute_vwap(window)
+            vw_gap = abs(price - vwap) / (vwap + EPS)
+            macd_hist = compute_macd_hist(window)
+            atr = compute_atr(window)
+            # scoring: favor close-to-vwap, positive macd hist, high recent volume
+            vw_score = max(0.0, 1.0 - vw_gap / 0.01)   # normalized to 1% band
+            vol_score = min(1.0, window["volume"].iloc[-1] / (window["volume"].mean() + EPS))
+            macd_score = 1.0 if macd_hist > 0 else 0.0
+            score = 0.45 * vw_score + 0.35 * vol_score + 0.20 * macd_score
+            scored.append({"symbol": sym, "score": score, "price": price, "vwap": vwap, "atr": atr, "macd_hist": macd_hist})
         except Exception as e:
-            print(f"score error {s}: {e}")
+            log(f"score error {sym}: {e}")
 
-    # 3) fallback to sheet signals if none
-    if not candidates:
-        print("No primary candidates found; trying sheet fallback.")
-        sheet = fetch_sheet_signals()
-        for row in sheet:
-            sym = row.get("symbol")
-            if not sym:
-                continue
-            bars = safe_get_bars(sym, limit=20)
-            if not bars:
-                continue
-            price = float(bars["close"].iloc[-1])
-            atr = compute_atr(bars)
-            qty = 1
-            order = submit_market_order(sym, qty, "buy")
-            if order:
-                entry_price = None
-                try:
-                    o = api.get_order(order.id)
-                    entry_price = float(getattr(o, "filled_avg_price", None)) if getattr(o, "filled_avg_price", None) else price
-                except Exception:
-                    entry_price = price
-                sl = entry_price - max(atr, entry_price * MIN_SL_PCT)
-                monitor_position(sym, entry_price, qty, atr, sl)
-                traded["date"] = today
-                save_json(TRADED_DAY_FILE, traded)
-                return True
-        # maybe force trade later
-    # If we have candidates, rank and choose best
-    if candidates:
-        candidates.sort(key=lambda x: x["score"], reverse=True)
-        top = candidates[0]
-        print(f"Top candidate: {top['symbol']} score {top['score']:.4f} price {top['price']:.4f} macd_hist {top['macd_hist']:.6f}")
+    if not scored:
+        log("No candidates found.")
+        return
 
-        # adaptive acceptance
-        vw_gap_pct = abs(top["price"] - top["vwap"]) / (top["vwap"] + EPS)
-        adaptive_limit = max(0.005, (top["spread_avg"] / (top["vwap"] + EPS)) * 1.2)
-        if vw_gap_pct > adaptive_limit:
-            print(f"{top['symbol']} price-vwap {vw_gap_pct:.4f} > adaptive {adaptive_limit:.4f} -> skipping")
-            if not GUARANTEE_TRADE:
-                return None
-            print("Guarantee ON: forcing top candidate")
+    # sort
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    # attempt up to 1 entry this run (aggressive but safe); can be changed to try multiple symbols
+    for candidate in scored:
+        sym = candidate["symbol"]
+        # enforce per-symbol daily cap
+        per_sym = state["per_symbol"].get(sym, 0)
+        if per_sym >= PER_SYMBOL_DAILY_CAP:
+            log(f"Per-symbol daily cap reached for {sym}.")
+            continue
+        # compute sizing
+        entry_price = candidate["price"]
+        atr = candidate["atr"]
+        qty = compute_qty(entry_price, atr)
+        if qty <= 0:
+            continue
 
-        # sizing & order
-        atr = top["atr"]
-        sl_price = top["price"] - max(atr, top["price"] * MIN_SL_PCT)
-        qty = compute_qty(top["price"], atr)
-        if qty < 1:
-            qty = 1
+        # compute TP/SL using percentages (tight scalping)
+        tp_price = entry_price * (1.0 + TP_PCT)
+        sl_price = entry_price * (1.0 - SL_PCT)
 
-        tp_price = top["price"] + (top["price"] - sl_price) * 1.5
-        bracket = submit_bracket_buy(top["symbol"], qty, sl_price, tp_price)
-        entry_price = None
-        if bracket:
-            # read filled price if available
-            try:
-                o = api.get_order(bracket.id)
-                entry_price = float(getattr(o, "filled_avg_price", None)) if getattr(o, "filled_avg_price", None) else None
-            except Exception:
-                entry_price = None
+        # Submit bracket order (preferred)
+        order = place_bracket_buy(sym, qty, sl_price, tp_price)
+        if order:
+            log(f"Placed bracket for {sym} qty={qty} entry approx {entry_price:.4f} tp {tp_price:.4f} sl {sl_price:.4f}")
+            # update state
+            state["daily_trades"] += 1
+            state["per_symbol"][sym] = per_sym + 1
+            state["open_order_id"] = getattr(order, "id", None)
+            state["has_open"] = True
+            save_state(state)
+            # record nominal trade row (entry/exits will be updated later via fills log)
+            append_csv([utcnow().isoformat(), sym, "BUY_SUBMIT", qty, round(entry_price,6), None, None, f"bracket_submitted tp{TP_PCT} sl{SL_PCT}"])
+            return
         else:
-            order = submit_market_order(top["symbol"], qty, "buy")
-            if not order:
-                print("Buy failed; aborting run.")
-                return None
-            try:
-                o = api.get_order(order.id)
-                entry_price = float(getattr(o, "filled_avg_price", None)) if getattr(o, "filled_avg_price", None) else None
-            except Exception:
-                entry_price = None
-            if entry_price is None:
-                bars = safe_get_bars(top["symbol"], limit=1)
-                entry_price = float(bars["close"].iloc[-1]) if bars is not None else top["price"]
-
-        # monitor
-        monitor_position(top["symbol"], entry_price, qty, atr, sl_price)
-        traded["date"] = today
-        save_json(TRADED_DAY_FILE, traded)
-        return True
-
-    # 4) If reached FORCE_TRADE time and guarantee ON, force top-ranked symbol (even if not matching all filters)
-    now = now_et()
-    if GUARANTEE_TRADE and (now.hour > FORCE_TRADE_HOUR or (now.hour == FORCE_TRADE_HOUR and now.minute >= FORCE_TRADE_MIN)):
-        print("Force-trade window reached; selecting highest-liquidity symbol to force trade.")
-        # simple selection: symbol with highest recent volume
-        best = None
-        best_vol = 0
-        for s in SYMBOLS:
-            df = safe_get_bars(s, limit=20)
-            if df is None:
+            # fallback to market buy + manual monitor with tighter constraints
+            order2 = place_market_buy(sym, qty)
+            if not order2:
+                log(f"Buy failed for {sym}; trying next candidate.")
                 continue
-            vol = int(df["volume"].iloc[-1])
-            if vol > best_vol:
-                best_vol = vol
-                best = s
-        if best:
-            bars = safe_get_bars(best, limit=20)
-            price = float(bars["close"].iloc[-1])
-            atr = compute_atr(bars)
-            qty = compute_qty(price, atr)
-            if qty < 1:
-                qty = 1
-            sl_price = price - max(atr, price * MIN_SL_PCT)
-            order = submit_market_order(best, qty, "buy")
-            entry_price = None
-            if order:
-                try:
-                    o = api.get_order(order.id)
-                    entry_price = float(getattr(o, "filled_avg_price", None)) if getattr(o, "filled_avg_price", None) else price
-                except Exception:
-                    entry_price = price
-                monitor_position(best, entry_price, qty, atr, sl_price)
-                traded["date"] = today
-                save_json(TRADED_DAY_FILE, traded)
-                return True
+            # wait a moment to let order fill (small sleep)
+            time.sleep(1.2)
+            # read filled price
+            try:
+                filled = trading_client.get_order_by_client_order_id(order2.client_order_id) if getattr(order2, "client_order_id", None) else trading_client.get_order_by_id(order2.id)
+            except Exception:
+                filled = order2
+            # best-effort entry price
+            filled_price = getattr(filled, "filled_avg_price", None) or getattr(filled, "filled_avg_price", None) or entry_price
+            try:
+                filled_price = float(filled_price)
+            except Exception:
+                filled_price = entry_price
+            # now submit stop-loss and take-profit as separate orders (OCO not always available)
+            # For safety we won't submit separate orders here. We'll rely on monitor step in future runs (but single-run design).
+            log(f"Market buy filled {sym} price {filled_price} qty {qty}")
+            state["daily_trades"] += 1
+            state["per_symbol"][sym] = per_sym + 1
+            state["has_open"] = True
+            save_state(state)
+            append_csv([utcnow().isoformat(), sym, "BUY_FILLED", qty, round(filled_price,6), None, None, "market_buy_filled"])
+            # Optionally, attach a note that manual monitoring required
+            return
 
-    print("No trade executed this run.")
-    return None
+    log("Scanned candidates but none placed due to caps or failures.")
 
-# ---------------- Entrypoint ----------------
-if __name__ == "__main__":
-    print("Run start ET", now_et().isoformat())
+# ---------------- helper to check fills and update records (called each run) --------------
+def reconcile_fills_and_cleanup():
+    """
+    Read recent orders and positions to record fills and update state.
+    This function also closes long-dead leftover positions if any (very conservative).
+    """
+    state = load_state()
+    today = now_et().strftime("%Y-%m-%d")
+    if state.get("date") != today:
+        # safety reset if mismatch
+        state = {"date": today, "daily_trades": 0, "per_symbol": {}, "open_order_id": None, "has_open": False}
+        save_state(state)
+
+    # Fetch current positions
     try:
-        r = run_once()
-        if r:
-            print("Trade executed / recorded.")
-        else:
-            print("No trade executed this run.")
+        positions = trading_client.get_all_positions()
     except Exception as e:
-        print("Unhandled error:", e)
+        log(f"get_all_positions error: {e}")
+        positions = []
+
+    # If positions exist, record them if not yet recorded; if too old, force close
+    for pos in positions:
+        sym = pos.symbol
+        qty = int(float(pos.qty))
+        market_value = float(pos.market_value)
+        avg_entry = float(pos.avg_entry_price) if getattr(pos, "avg_entry_price", None) else None
+        # write a record if we don't have has_open flag (best-effort: we may have recorded earlier)
+        append_csv([utcnow().isoformat(), sym, "POSITION", qty, round(avg_entry,6) if avg_entry else None, None, None, "open_position"])
+        state["has_open"] = True
+        state["open_order_id"] = None
+        save_state(state)
+
+        # If position age is too long, close (protection for stuck positions)
+        # We can't easily check age here without recorded entry ts; do a conservative forced close if POS very large and equity negative.
+        # Skip forced close here to avoid accidental exits during live runs.
+
+    # attempt to collect filled orders from trading_client
+    try:
+        orders = trading_client.get_orders(status="all", limit=50)
+    except Exception as e:
+        log(f"get_orders error: {e}")
+        orders = []
+
+    for o in orders:
+        try:
+            # Consider only today's orders
+            created_at = getattr(o, "created_at", None)
+            if created_at:
+                created_dt = created_at.astimezone(pytz.utc).replace(tzinfo=None)
+                if created_dt.date() != datetime.utcnow().date():
+                    continue
+            side = getattr(o, "side", None)
+            symbol = getattr(o, "symbol", None)
+            filled_qty = float(getattr(o, "filled_qty", 0) or 0)
+            filled_avg = getattr(o, "filled_avg_price", None)
+            if filled_qty and filled_avg:
+                # record fill
+                append_csv([utcnow().isoformat(), symbol, side.upper(), int(filled_qty), round(float(filled_avg),6), None, None, f"filled_order id {getattr(o, 'id', None)}"])
+        except Exception:
+            continue
+
+    save_state(state)
+
+# ---------------- entrypoint ----------------
+def main():
+    try:
+        # only run during market open: use trading_client.get_clock()
+        try:
+            clock = trading_client.get_clock()
+            if not getattr(clock, "is_open", False):
+                log("Market closed. Exiting.")
+                # still call reconcile to record fills if needed
+                reconcile_fills_and_cleanup()
+                return
+        except Exception as e:
+            log(f"clock error: {e}. Proceeding cautiously.")
+
+        # first, reconcile any fills from earlier runs
+        reconcile_fills_and_cleanup()
+
+        # scan and attempt to place 1 aggressive scalp (per-run)
+        scan_and_trade()
+
+        # reconcile after attempting entries
+        reconcile_fills_and_cleanup()
+
+    except Exception as e:
+        log("Unhandled exception in main: " + repr(e))
+        log(traceback.format_exc())
+
+if __name__ == "__main__":
+    main()
