@@ -1,17 +1,17 @@
-name: Trade Bot (every 10m during market hours)
+name: HF Scalper Bot (every 10m during market hours)
 
 on:
   schedule:
-    - cron: "*/10 13-20 * * 1-5"   # every 10 minutes UTC 13:00–20:59 => covers US market hours
+    - cron: "*/10 13-20 * * 1-5"   # every 10 minutes UTC 13:00–20:59 -> US market hours
   workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -24,7 +24,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run bot
+      - name: Run HF scalper
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
