@@ -2,7 +2,11 @@ name: TradeBot
 
 on:
   schedule:
-    - cron: "*/10 14-21 * * 1-5"   # Every 10 minutes 9:00 AM - 4:59 PM ET (market hours)
+    # GitHub cron is UTC. 9:30 ET = 14:30 UTC, 16:00 ET = 21:00 UTC
+    # Runs every 10 minutes from 14:30–21:00 UTC (9:30–16:00 ET)
+    - cron: "30-59/10 14 * * 1-5"   # 14:30, 14:40, 14:50 UTC → 9:30–9:50 ET
+    - cron: "*/10 15-20 * * 1-5"   # 15:00–20:50 UTC → 10:00–15:50 ET
+    - cron: "0 21 * * 1-5"          # 21:00 UTC → 16:00 ET (market close)
   workflow_dispatch:
 
 jobs:
@@ -19,7 +23,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install --upgrade pip && pip install -r requirements.txt
 
       - name: Run TradeBot
         env:
