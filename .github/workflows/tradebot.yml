@@ -2,8 +2,8 @@ name: TradeBot
 
 on:
   schedule:
-    - cron: "0 14 * * 1-5"   # 9:00 AM ET (market open prep)
-    - cron: "0 20 * * 1-5"   # 3:00 PM ET (afternoon run)
+    - cron: "0 14 * * 1-5"   # 9:00 AM ET
+    - cron: "0 20 * * 1-5"   # 3:00 PM ET
   workflow_dispatch:
 
 jobs:
@@ -23,6 +23,10 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run TradeBot
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
         run: |
           echo "Start $(TZ='America/New_York' date)"
-          python hybrid_tradebot_spy_signals.py
+          python hybrid_tradebot_v3.py
