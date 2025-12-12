@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-hybrid_tradebot_v7.py
-- Uses alpaca-trade-api for orders and account info
-- Uses yfinance for minute bars
-- Risk-controlled ~2–4 trades/day
-- Single-run script, intended for 10-min schedule
-- TP/SL rounded to 2 decimals to satisfy Alpaca
+hybrid_tradebot_v8.py
+- Alpaca + yfinance fallback
+- 2-4 trades/day, efficient scoring
+- Market-friendly take-profit/stop-loss rounding
+- Single-run: scheduled every 10 minutes
 """
 
 import os
@@ -14,8 +13,9 @@ import math
 import json
 import csv
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -25,19 +25,20 @@ from alpaca_trade_api.rest import REST
 SYMBOLS = ["SPY", "QQQ", "IWM", "DIA"]
 MAX_TRADES_PER_DAY = 4
 PER_SYMBOL_DAILY_CAP = 2
-TP_PCT = 0.0020  # 0.2%
-SL_PCT = 0.0015  # 0.15%
+TP_PCT = 0.002       # 0.2%
+SL_PCT = 0.0015      # 0.15%
 RISK_PER_TRADE = 0.015
 ATR_PERIOD = 14
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
-MIN_VOLUME = 2_500
-VWAP_BAND = 0.005
+MIN_VOLUME = 2500
+VWAP_BAND = 0.0075
+ENTRY_SCORE_THRESHOLD = 0.20  # lower threshold
+STATE_FILE = "bot_state_v8.json"
+TRADES_CSV = "trades_v8.csv"
+LOG_FILE = "bot_v8.log"
 
-STATE_FILE = "bot_state_v7.json"
-TRADES_CSV = "trades_v7.csv"
-LOG_FILE = "bot_v7.log"
 TZ = pytz.timezone("US/Eastern")
 EPS = 1e-9
 
@@ -46,11 +47,11 @@ ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL")
 if not (ALPACA_API_KEY and ALPACA_SECRET_KEY and ALPACA_BASE_URL):
-    raise RuntimeError("Set Alpaca secrets in repository")
+    raise RuntimeError("Set Alpaca secrets!")
 
 api = REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL)
 
-# ---------------- Logging / State ----------------
+# ---------------- Logging ----------------
 def now_et():
     return datetime.now(TZ)
 
@@ -63,7 +64,7 @@ def log(s):
     try:
         with open(LOG_FILE, "a") as f:
             f.write(line + "\n")
-    except:
+    except Exception:
         pass
 
 def load_state():
@@ -72,7 +73,7 @@ def load_state():
     try:
         with open(STATE_FILE, "r") as f:
             return json.load(f)
-    except:
+    except Exception:
         return {"date": None, "daily_trades": 0, "per_symbol": {}}
 
 def save_state(s):
@@ -95,25 +96,21 @@ def append_trade_row(row):
         log(f"append_trade_row error: {e}")
 
 # ---------------- Market Data ----------------
-def fetch_bars_yf(symbol, minutes=200):
+def fetch_recent_bars(symbol, minutes=120):
     try:
         period_days = max(1, (minutes // 60) + 1)
         df = yf.download(symbol, period=f"{period_days}d", interval="1m", progress=False)
         if df is None or df.empty:
             return None
         df = df.rename(columns=str.lower)
-        required_cols = {"open","high","low","close","volume"}
-        if not required_cols.issubset(df.columns):
-            return None
-        df = df[["open","high","low","close","volume"]]
+        for col in ["open","high","low","close","volume"]:
+            if col not in df.columns:
+                return None
         df.index = df.index.tz_localize(None)
         return df.tail(minutes)
     except Exception as e:
-        log(f"fetch_bars_yf error {symbol}: {e}")
+        log(f"fetch_recent_bars error {symbol}: {e}")
         return None
-
-def fetch_recent_bars(symbol, minutes=200):
-    return fetch_bars_yf(symbol, minutes)
 
 # ---------------- Indicators ----------------
 def compute_atr(df, period=ATR_PERIOD):
@@ -122,12 +119,15 @@ def compute_atr(df, period=ATR_PERIOD):
     close = df["close"]
     prev = close.shift(1)
     tr = pd.concat([high-low, (high-prev).abs(), (low-prev).abs()], axis=1).max(axis=1)
-    return float(tr.rolling(period, min_periods=1).mean().iloc[-1])
+    atr = tr.rolling(period, min_periods=1).mean().iloc[-1]
+    return float(max(atr, 1e-6))
 
 def compute_vwap(df):
-    pv = (df["close"]*df["volume"]).sum()
+    pv = (df["close"] * df["volume"]).sum()
     v = df["volume"].sum()
-    return float(pv/v) if v>0 else float(df["close"].iloc[-1])
+    if v <= 0:
+        return float(df["close"].iloc[-1])
+    return float(pv / v)
 
 def compute_macd_hist(df):
     close = df["close"]
@@ -135,12 +135,13 @@ def compute_macd_hist(df):
     ema_slow = close.ewm(span=MACD_SLOW, adjust=False).mean()
     macd = ema_fast - ema_slow
     sig = macd.ewm(span=MACD_SIGNAL, adjust=False).mean()
-    return float(macd.iloc[-1] - sig.iloc[-1])
+    return float((macd - sig).iloc[-1])
 
-# ---------------- Position Sizing ----------------
+# ---------------- Sizing ----------------
 def get_equity():
     try:
-        return float(api.get_account().equity)
+        acct = api.get_account()
+        return float(acct.equity)
     except:
         return None
 
@@ -148,16 +149,18 @@ def compute_qty(entry_price, atr):
     equity = get_equity()
     if equity is None or equity <= 0:
         return 1
-    risk_amount = equity*RISK_PER_TRADE
-    per_share_risk = max(atr, entry_price*0.0005)
-    qty = int(max(1, math.floor(risk_amount/(per_share_risk+EPS))))
-    max_nominal = int(max(1, math.floor(equity*0.3/entry_price)))
+    risk_amount = equity * RISK_PER_TRADE
+    per_share_risk = max(atr, entry_price * 0.0005)
+    qty = int(max(1, math.floor(risk_amount / (per_share_risk + EPS))))
+    max_nominal = int(max(1, math.floor((equity*0.3)/entry_price)))
     return min(qty, max_nominal)
 
 # ---------------- Orders ----------------
+def round_price(p):
+    # round to nearest cent
+    return round(p + 1e-6, 2)
+
 def submit_bracket(symbol, qty, sl_price, tp_price):
-    sl_price = round(sl_price,2)
-    tp_price = round(tp_price,2)
     try:
         order = api.submit_order(
             symbol=symbol,
@@ -166,67 +169,68 @@ def submit_bracket(symbol, qty, sl_price, tp_price):
             type='market',
             time_in_force='day',
             order_class='bracket',
-            take_profit={'limit_price': str(tp_price)},
-            stop_loss={'stop_price': str(sl_price)}
+            take_profit={'limit_price': str(round_price(tp_price))},
+            stop_loss={'stop_price': str(round_price(sl_price))}
         )
-        log(f"Bracket submitted: {symbol} qty={qty} TP={tp_price} SL={sl_price}")
+        log(f"Bracket submitted: {symbol} qty={qty} tp={tp_price:.2f} sl={sl_price:.2f}")
         return order
     except Exception as e:
         log(f"submit_bracket error: {e}")
         return None
 
-# ---------------- Utilities ----------------
+# ---------------- Utility ----------------
 def has_open_positions():
     try:
-        return len(api.list_positions())>0
+        return len(api.list_positions()) > 0
     except:
         return False
 
 # ---------------- Scoring ----------------
 def compute_score(df):
     df = df.dropna(subset=["close","high","low","volume"])
-    if df.empty:
+    if df.empty or len(df) < 10:
         return None
-    price = float(df["close"].iloc[-1])
     volume = float(df["volume"].iloc[-1])
     if volume < MIN_VOLUME:
         return None
-    vwap = compute_vwap(df)
-    vw_gap = abs(price-vwap)/(vwap+EPS)
-    macd_hist = compute_macd_hist(df)
-    atr = compute_atr(df)
-    vol_score = min(1.0, volume/(df["volume"].mean()+EPS))
-    vw_score = max(0.0, 1.0-vw_gap/VWAP_BAND)
-    macd_score = 1.0 if macd_hist>0 else 0.0
-    score = 0.45*vw_score + 0.35*vol_score + 0.2*macd_score
+    window = df.tail(60)
+    price = float(window["close"].iloc[-1])
+    vwap = compute_vwap(window)
+    vw_gap = abs(price - vwap)/(vwap+EPS)
+    macd_hist = compute_macd_hist(window)
+    atr = compute_atr(window)
+    vol_score = min(1.0, float(window["volume"].iloc[-1])/(float(window["volume"].mean())+EPS))
+    vw_score = max(0.0, 1.0 - vw_gap/VWAP_BAND)
+    macd_score = 1.0 if macd_hist > 0 else 0.0
+    score = 0.40*vw_score + 0.40*vol_score + 0.20*macd_score
     return {"score": score, "price": price, "atr": atr}
 
 def pick_trade_candidate():
-    best = None
-    best_score = 0
-    for s in SYMBOLS:
-        df = fetch_recent_bars(s, 60)
+    scored = []
+    for sym in SYMBOLS:
+        df = fetch_recent_bars(sym)
         if df is None:
             continue
-        sc = compute_score(df)
-        if sc is None:
+        info = compute_score(df)
+        if info is None:
             continue
-        if sc["score"]>best_score:
-            best_score = sc["score"]
-            best = {"symbol": s, **sc}
-    return best
+        if info["score"] >= ENTRY_SCORE_THRESHOLD:
+            scored.append((sym, info))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: x[1]["score"], reverse=True)
+    return scored[0]  # top candidate
 
-# ---------------- Main Run ----------------
+# ---------------- Main ----------------
 def main():
     log(f"Run start ET {now_et().isoformat()}")
-
     try:
         clock = api.get_clock()
         if not getattr(clock, "is_open", False):
-            log("Market closed; exiting")
+            log("Market closed")
             return
     except:
-        log("Clock fetch error; exiting")
+        log("Clock fetch failed")
         return
 
     state = load_state()
@@ -236,44 +240,47 @@ def main():
         save_state(state)
 
     if state["daily_trades"] >= MAX_TRADES_PER_DAY:
-        log("Daily trade cap reached")
+        log("Daily cap reached")
         return
 
     if has_open_positions():
-        log("Open positions detected; skipping")
+        log("Open positions exist, skipping entry")
         return
 
     candidate = pick_trade_candidate()
-    if candidate is None or candidate["score"]<0.25:
+    if candidate is None:
         log("No candidate meets score threshold")
         return
 
-    sym = candidate["symbol"]
-    per_sym = state["per_symbol"].get(sym,0)
-    if per_sym>=PER_SYMBOL_DAILY_CAP:
-        log(f"{sym} per-symbol cap reached")
+    sym, info = candidate
+    per_sym = state["per_symbol"].get(sym, 0)
+    if per_sym >= PER_SYMBOL_DAILY_CAP:
+        log(f"Per-symbol cap reached for {sym}")
         return
 
-    price = candidate["price"]
-    atr = candidate["atr"]
-    qty = compute_qty(price, atr)
-    if qty<1:
+    entry_price = info["price"]
+    atr = info["atr"]
+    qty = compute_qty(entry_price, atr)
+    if qty < 1:
+        log("Computed qty < 1, skipping")
         return
 
-    tp = price*(1+TP_PCT)
-    sl = price*(1-SL_PCT)
+    tp = entry_price*(1+TP_PCT)
+    sl = entry_price*(1-SL_PCT)
 
     order = submit_bracket(sym, qty, sl, tp)
     if order:
         state["daily_trades"] += 1
-        state["per_symbol"][sym] = per_sym+1
+        state["per_symbol"][sym] = per_sym + 1
         save_state(state)
-        append_trade_row([utcnow_iso(), sym, "BUY", qty, round(price,2), None, None, f"score:{candidate['score']:.3f}"])
-        log(f"Placed bracket for {sym} qty={qty} score={candidate['score']:.3f}")
+        append_trade_row([utcnow_iso(), sym, "BUY_SUBMIT", qty, round_price(entry_price), None, None, f"score:{info['score']:.3f}"])
+        log(f"Placed bracket for {sym} qty={qty} score={info['score']:.3f}")
+    else:
+        log("Failed to submit order")
 
-if __name__=="__main__":
+if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        log("Unhandled exception: "+repr(e))
+        log(f"Unhandled exception: {repr(e)}")
         log(traceback.format_exc())
