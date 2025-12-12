@@ -28,4 +28,4 @@ jobs:
           ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
         run: |
           echo "Start $(TZ='America/New_York' date)"
-          python hybrid_tradebot_v10.py
+          python hybrid_tradebot_v13_1.py
