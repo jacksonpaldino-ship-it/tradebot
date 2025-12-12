@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
 """
-hybrid_tradebot_v3.py
-
-Goals:
-- Minimum 1 trade/day guaranteed (forced trade at FORCE_HOUR:FORCE_MIN ET)
-- Target ~5 trades/day (configurable caps)
-- MACD + VWAP + volume scoring, ATR-based sizing
-- Bracket orders (TP + SL) preferred, market fallback
-- Single-run: exit quickly (designed to be scheduled every 10 minutes)
-- Uses alpaca-trade-api (REST) and yfinance fallback for market data
+hybrid_tradebot_v3.py (cleaned, error-free)
+- Uses alpaca-trade-api for orders and account info
+- Uses yfinance for minute bars (reliable without Alpaca data subscription)
+- Single-run script intended to be scheduled (every 10 minutes)
 """
 
 import os
@@ -17,9 +12,8 @@ import math
 import json
 import csv
 import traceback
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta
 import pytz
-import requests
 
 import numpy as np
 import pandas as pd
@@ -102,46 +96,29 @@ def append_trade_row(row):
     except Exception as e:
         log(f"append_trade_row error: {e}")
 
-# ---------------- market data helpers ----------------
-def fetch_bars_alpaca(symbol, limit=200):
-    """
-    Try Alpaca bars; fall back to None on any error.
-    Returns DataFrame with columns open,high,low,close,volume (index = timestamp)
-    """
-    try:
-        bars = api.get_barset(symbol, timeframe='1Min', limit=limit)
-        # alpaca-trade-api returns BarList in a dict
-        if symbol not in bars or len(bars[symbol]) == 0:
-            return None
-        # convert to DataFrame
-        rows = []
-        for b in bars[symbol]:
-            rows.append({'t': b.t, 'open': b.o, 'high': b.h, 'low': b.l, 'close': b.c, 'volume': b.v})
-        df = pd.DataFrame(rows).set_index('t')
-        df.index = pd.to_datetime(df.index)
-        return df
-    except Exception as e:
-        # drop to yfinance fallback
-        return None
-
+# ---------------- market data helpers (yfinance) ----------------
 def fetch_bars_yf(symbol, minutes=200):
+    """
+    Use yfinance to fetch recent minute bars. Returns DataFrame with columns open,high,low,close,volume.
+    """
     try:
-        # yfinance returns tz-aware index; remove tz
-        period = f"{max(1, (minutes // 60) + 1)}d"
-        df = yf.download(symbol, period=period, interval="1m", progress=False)
+        period_days = max(1, (minutes // 60) + 1)
+        period = f"{period_days}d"
+        df = yf.download(tickers=symbol, period=period, interval="1m", progress=False)
         if df is None or df.empty:
             return None
-        df.columns = [c.lower() for c in df.columns]
+        df = df.rename(columns=str.lower)
+        if not {"open","high","low","close","volume"}.issubset(df.columns):
+            return None
         df = df[["open","high","low","close","volume"]]
         df.index = df.index.tz_localize(None)
         return df.tail(minutes)
     except Exception as e:
+        log(f"fetch_bars_yf error {symbol}: {e}")
         return None
 
 def fetch_recent_bars(symbol, minutes=200):
-    df = fetch_bars_alpaca(symbol, limit=minutes)
-    if df is not None:
-        return df
+    # Always use yfinance fallback (avoids Alpaca data subscription issues)
     return fetch_bars_yf(symbol, minutes=minutes)
 
 # ---------------- indicators ----------------
@@ -227,7 +204,7 @@ def has_open_positions():
         log(f"list_positions error: {e}")
         return False
 
-# ---------------- main logic ----------------
+# ---------------- scoring / trade decisions ----------------
 def score_symbol(symbol):
     df = fetch_recent_bars(symbol, minutes=120)
     if df is None or df.empty or len(df) < 10:
@@ -245,27 +222,26 @@ def score_symbol(symbol):
     vw_gap = abs(price - vwap) / (vwap + EPS)
     macd_hist = compute_macd_hist(window)
     atr = compute_atr(window)
-    # adaptive spread normalization
-    vol_score = min(1.0, window["volume"].iloc[-1] / (window["volume"].mean() + EPS))
+    # adaptive scoring components
+    vol_score = min(1.0, float(window["volume"].iloc[-1]) / (float(window["volume"].mean()) + EPS))
     vw_score = max(0.0, 1.0 - vw_gap / VWAP_BAND)
     macd_score = 1.0 if macd_hist > 0 else 0.0
     score = 0.45 * vw_score + 0.35 * vol_score + 0.20 * macd_score
     return {"symbol": symbol, "score": float(score), "price": price, "vwap": vwap, "atr": atr, "macd_hist": macd_hist, "vol": volume_last}
 
 def force_trade(symbol):
-    # Conservative forced trade: small size (1% equity risk) so force does not blow account
+    # Conservative forced trade: small size so force does not blow account
     df = fetch_recent_bars(symbol, minutes=60)
     if df is None or df.empty:
         return False
     price = float(df["close"].iloc[-1])
     atr = compute_atr(df)
-    # use smaller risk for forced trade
     equity = get_equity() or 0
-    per_trade_risk = max(0.005, RISK_PER_TRADE/3)  # ~0.5% or smaller
+    per_trade_risk = max(0.005, RISK_PER_TRADE/3)
     risk_amount = equity * per_trade_risk
     per_share_risk = max(atr, price * 0.0005)
     qty = int(max(1, math.floor(risk_amount / (per_share_risk + EPS))))
-    qty = min(qty, int(max(1, math.floor((equity * 0.2) / price))))  # cap nominal
+    qty = min(qty, int(max(1, math.floor((equity * 0.2) / price))))
     if qty <= 0:
         return False
     tp = price * (1 + TP_PCT)
@@ -277,6 +253,7 @@ def force_trade(symbol):
         return True
     return False
 
+# ---------------- main run ----------------
 def run_once():
     log(f"Run start ET {now_et().isoformat()}")
 
@@ -288,7 +265,6 @@ def run_once():
             return
     except Exception as e:
         log(f"get_clock error: {e}")
-        # if error fetching clock, exit to be safe
         return
 
     # load/reset state
@@ -298,14 +274,14 @@ def run_once():
         state = {"date": today, "daily_trades": 0, "per_symbol": {}, "open_order_id": None}
         save_state(state)
 
-    # if daily cap reached, exit
+    # daily cap
     if state["daily_trades"] >= MAX_TRADES_PER_DAY:
         log(f"Daily cap reached {state['daily_trades']}/{MAX_TRADES_PER_DAY}")
         return
 
     # if there's any open position, skip entering new trade (we rely on bracket exits)
     if has_open_positions():
-        log("Open positions detected; skipping entry until cleared.")
+        log("Open positions detected; skipping entry this run.")
         return
 
     # score universe
@@ -321,14 +297,13 @@ def run_once():
     if scored:
         # sort by score desc
         scored.sort(key=lambda x: x["score"], reverse=True)
-        # try top candidates until one placed or none left (but respect per-symbol caps)
+        # try top candidates until one placed or none left (respect per-symbol caps)
         for cand in scored:
             sym = cand["symbol"]
             per_sym = state["per_symbol"].get(sym, 0)
             if per_sym >= PER_SYMBOL_DAILY_CAP:
                 log(f"Per-symbol cap reached for {sym}")
                 continue
-            # acceptance: require minimum score to avoid spam; tuned to target ~5/day
             if cand["score"] < 0.25:
                 log(f"{sym} score {cand['score']:.3f} below entry threshold")
                 continue
@@ -352,11 +327,11 @@ def run_once():
             # fallback market buy
             order2 = submit_market_buy(sym, qty)
             if order2:
-                # best-effort filled price
                 time.sleep(1.2)
                 try:
                     o = api.get_order(order2.id)
-                    fill_price = float(getattr(o, "filled_avg_price", None)) if getattr(o, "filled_avg_price", None) else entry_price
+                    fill_price = getattr(o, "filled_avg_price", None) or entry_price
+                    fill_price = float(fill_price)
                 except Exception:
                     fill_price = entry_price
                 state["daily_trades"] += 1
@@ -365,7 +340,6 @@ def run_once():
                 append_trade_row([utcnow_iso(), sym, "BUY_FILLED", qty, round(fill_price,6), None, None, f"score:{cand['score']:.3f}"])
                 log(f"Placed market buy for {sym} qty={qty} filled {fill_price:.4f}")
                 return
-            # else try next candidate
         log("Scored candidates exhausted; no order placed.")
     else:
         log("No scored candidates this run.")
@@ -374,7 +348,6 @@ def run_once():
     now = now_et()
     if GUARANTEE_TRADE and (now.hour > FORCE_HOUR or (now.hour == FORCE_HOUR and now.minute >= FORCE_MIN)):
         log("Force-trade window reached; attempting forced trade.")
-        # choose highest-volume symbol
         best = None
         best_vol = 0
         for s in SYMBOLS:
@@ -396,7 +369,6 @@ def run_once():
                 save_state(state)
                 return
         log("Forced trade attempt failed or no symbol available.")
-    # no trade executed
     log("Run complete. No trade executed this run.")
 
 if __name__ == "__main__":
