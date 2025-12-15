@@ -1,32 +1,24 @@
 #!/usr/bin/env python3
-"""
-hybrid_tradebot_v14.py
-INTENTIONALLY AGGRESSIVE
-- High trade frequency
-- Minimal filters
-- Tight risk control
-"""
 
-import os, json, csv, traceback
-from datetime import datetime
+import os
+import math
+import json
 import pytz
-import numpy as np
-import pandas as pd
 import yfinance as yf
+import pandas as pd
+from datetime import datetime
 from alpaca_trade_api.rest import REST
 
 # ================= CONFIG =================
 SYMBOLS = ["SPY", "QQQ", "IWM", "DIA"]
 
-MAX_TRADES_PER_DAY = 10
-TP_PCT = 0.0012      # 0.12%
-SL_PCT = 0.0008      # 0.08%
-RISK_PER_TRADE = 0.015
-ATR_PERIOD = 14
+TP_PCT = 0.003      # 0.30%
+SL_PCT = 0.002      # 0.20%
 
-STATE_FILE = "bot_state_v14.json"
-TRADES_CSV = "trades_v14.csv"
-LOG_FILE = "bot_v14.log"
+RISK_PCT = 0.005    # 0.5% equity per trade
+MAX_TRADES_PER_DAY = 6
+
+STATE_FILE = "bot_state.json"
 TZ = pytz.timezone("US/Eastern")
 
 # ================= ALPACA =================
@@ -37,70 +29,86 @@ api = REST(
 )
 
 # ================= UTIL =================
-def now_et():
-    return datetime.now(TZ)
-
 def log(msg):
-    ts = datetime.utcnow().isoformat()
-    print(ts, msg)
-    with open(LOG_FILE, "a") as f:
-        f.write(f"{ts} {msg}\n")
+    print(f"{datetime.now(TZ)} {msg}")
 
 def load_state():
     if not os.path.exists(STATE_FILE):
         return {"date": None, "trades": 0}
-    return json.load(open(STATE_FILE))
+    with open(STATE_FILE, "r") as f:
+        return json.load(f)
 
-def save_state(s):
-    json.dump(s, open(STATE_FILE, "w"))
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
 
-def record_trade(row):
-    header = ["utc","symbol","qty","entry","tp","sl"]
-    exists = os.path.exists(TRADES_CSV)
-    with open(TRADES_CSV, "a", newline="") as f:
-        w = csv.writer(f)
-        if not exists:
-            w.writerow(header)
-        w.writerow(row)
+def market_open():
+    return api.get_clock().is_open
+
+def has_position():
+    return len(api.list_positions()) > 0
+
+def round_price(p):
+    return round(p, 2)  # ETF-safe
 
 # ================= DATA =================
 def fetch(symbol):
-    df = yf.download(symbol, interval="1m", period="1d", progress=False)
-    if df.empty:
-        return None
-    df.columns = [c.lower() for c in df.columns]
-    return df.tail(60)
+    df = yf.download(
+        symbol,
+        interval="1m",
+        period="1d",
+        auto_adjust=True,
+        progress=False
+    )
 
-def atr(df):
-    h, l, c = df["high"], df["low"], df["close"]
-    tr = pd.concat([(h-l),(h-c.shift()).abs(),(l-c.shift()).abs()], axis=1).max(axis=1)
-    return float(tr.rolling(ATR_PERIOD).mean().iloc[-1])
+    if df is None or df.empty:
+        return None
+
+    # Handle MultiIndex safely
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0].lower() for c in df.columns]
+    else:
+        df.columns = [str(c).lower() for c in df.columns]
+
+    required = {"open", "high", "low", "close", "volume"}
+    if not required.issubset(df.columns):
+        return None
+
+    return df.tail(30)
+
+def vwap(df):
+    pv = (df["close"] * df["volume"]).sum()
+    v = df["volume"].sum()
+    return pv / v if v > 0 else df["close"].iloc[-1]
 
 # ================= STRATEGY =================
-def should_trade(df):
-    """Extremely loose conditions"""
+def should_enter(df):
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    momentum = abs(last.close - prev.close) / prev.close
-    range_expansion = (last.high - last.low) / last.close
+    vw = vwap(df)
+    vol_avg = df["volume"].rolling(10).mean().iloc[-1]
 
-    # Trade if price is MOVING
-    return momentum > 0.0003 or range_expansion > 0.001
+    return (
+        last["close"] > vw and
+        last["close"] > last["open"] and
+        last["volume"] > vol_avg * 0.7 and
+        last["close"] > prev["close"]
+    )
 
-def position_size(price, atr_val):
+def position_size(price):
     equity = float(api.get_account().equity)
-    risk = equity * RISK_PER_TRADE
-    per_share = max(atr_val, price * 0.0005)
-    qty = int(risk / per_share)
-    max_qty = int((equity * 0.3) / price)
-    return max(1, min(qty, max_qty))
+    risk_dollars = equity * RISK_PCT
+    stop_dist = price * SL_PCT
+    qty = int(risk_dollars / stop_dist)
+    return max(1, qty)
 
-# ================= EXECUTION =================
-def submit(symbol, price, atr_val):
-    qty = position_size(price, atr_val)
-    tp = round(price * (1 + TP_PCT), 2)
-    sl = round(price * (1 - SL_PCT), 2)
+# ================= ORDER =================
+def submit_trade(symbol, price):
+    qty = position_size(price)
+
+    tp = round_price(price * (1 + TP_PCT))
+    sl = round_price(price * (1 - SL_PCT))
 
     api.submit_order(
         symbol=symbol,
@@ -109,52 +117,49 @@ def submit(symbol, price, atr_val):
         type="market",
         time_in_force="day",
         order_class="bracket",
-        take_profit={"limit_price": str(tp)},
-        stop_loss={"stop_price": str(sl)}
+        take_profit={"limit_price": tp},
+        stop_loss={"stop_price": sl}
     )
 
-    record_trade([datetime.utcnow().isoformat(), symbol, qty, price, tp, sl])
-    log(f"TRADE {symbol} qty={qty} entry={price:.2f} tp={tp} sl={sl}")
+    log(f"TRADE {symbol} qty={qty} tp={tp} sl={sl}")
 
 # ================= MAIN =================
 def main():
-    log(f"Run start ET {now_et()}")
+    log("Run start")
 
-    if not api.get_clock().is_open:
+    if not market_open():
         log("Market closed")
         return
 
     state = load_state()
-    today = now_et().strftime("%Y-%m-%d")
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
 
     if state["date"] != today:
         state = {"date": today, "trades": 0}
+        save_state(state)
 
     if state["trades"] >= MAX_TRADES_PER_DAY:
         log("Daily cap reached")
         return
 
-    for sym in SYMBOLS:
-        if state["trades"] >= MAX_TRADES_PER_DAY:
-            break
+    if has_position():
+        log("Position open, skipping")
+        return
 
+    for sym in SYMBOLS:
         df = fetch(sym)
-        if df is None or len(df) < 20:
+        if df is None or len(df) < 5:
             continue
 
-        if should_trade(df):
-            price = float(df["close"].iloc[-1])
-            atr_val = atr(df)
-            submit(sym, price, atr_val)
+        if should_enter(df):
+            price = df["close"].iloc[-1]
+            submit_trade(sym, price)
+
             state["trades"] += 1
             save_state(state)
-            break  # ONE TRADE PER RUN (important)
+            return  # ONE TRADE PER RUN
 
-    log("Run complete")
+    log("No entries")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        log("ERROR " + repr(e))
-        log(traceback.format_exc())
+    main()
