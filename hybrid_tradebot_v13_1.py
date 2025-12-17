@@ -2,11 +2,9 @@
 
 import os
 import math
-import time
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 
-import numpy as np
 import pandas as pd
 import yfinance as yf
 from alpaca_trade_api.rest import REST
@@ -14,15 +12,13 @@ from alpaca_trade_api.rest import REST
 # ================= CONFIG =================
 SYMBOLS = ["SPY", "QQQ", "IWM", "DIA"]
 
-LOOKBACK_MINUTES = 20        # momentum window
-MIN_MOVE_PCT = 0.0015        # 0.15% net move (easy to hit)
-RISK_PER_TRADE = 0.01        # 1% equity risk
-TAKE_PROFIT_PCT = 0.003      # 0.30%
-STOP_LOSS_PCT = 0.002        # 0.20%
+LOOKBACK_MIN = 15            # very short momentum
+MIN_MOVE_PCT = 0.0008        # 0.08% move (EXTREMELY EASY)
+RISK_PER_TRADE = 0.015       # 1.5%
+TP_PCT = 0.0025              # 0.25%
+SL_PCT = 0.0018              # 0.18%
 
-MIN_VOLUME = 2000            # very permissive
-MAX_TRADES_PER_DAY = 5
-
+MIN_VOLUME = 1000
 TZ = pytz.timezone("US/Eastern")
 
 # ================= ALPACA =================
@@ -36,11 +32,8 @@ if not API_KEY or not API_SECRET or not BASE_URL:
 api = REST(API_KEY, API_SECRET, BASE_URL)
 
 # ================= UTILS =================
-def now_et():
-    return datetime.now(TZ)
-
 def log(msg):
-    print(f"{now_et()} {msg}")
+    print(f"{datetime.now(TZ)} {msg}")
 
 def market_open():
     try:
@@ -58,7 +51,7 @@ def equity():
     try:
         return float(api.get_account().equity)
     except:
-        return 0
+        return 0.0
 
 # ================= DATA =================
 def fetch(symbol):
@@ -66,69 +59,63 @@ def fetch(symbol):
         symbol,
         period="1d",
         interval="1m",
-        progress=False
+        progress=False,
+        auto_adjust=True
     )
 
     if df is None or df.empty:
         return None
 
-    df = df.copy()
-    df.columns = [c.lower() for c in df.columns]
-    df = df.tail(LOOKBACK_MINUTES + 5)
+    # 🔧 FIX: flatten MultiIndex columns
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0].lower() for c in df.columns]
+    else:
+        df.columns = [str(c).lower() for c in df.columns]
 
-    if not {"open","high","low","close","volume"}.issubset(df.columns):
+    required = {"open", "high", "low", "close", "volume"}
+    if not required.issubset(df.columns):
         return None
 
-    return df.dropna()
-
-def vwap(df):
-    pv = (df["close"] * df["volume"]).sum()
-    v = df["volume"].sum()
-    return pv / v if v > 0 else df["close"].iloc[-1]
+    df = df.dropna()
+    return df.tail(LOOKBACK_MIN + 5)
 
 # ================= SIGNAL =================
-def score_symbol(symbol):
+def get_signal(symbol):
     df = fetch(symbol)
-    if df is None or len(df) < LOOKBACK_MINUTES:
+    if df is None or len(df) < LOOKBACK_MIN:
         return None
 
-    recent = df.tail(LOOKBACK_MINUTES)
+    recent = df.tail(LOOKBACK_MIN)
 
-    price_now = recent["close"].iloc[-1]
-    price_then = recent["close"].iloc[0]
-    move_pct = (price_now - price_then) / price_then
+    start = recent["close"].iloc[0]
+    end = recent["close"].iloc[-1]
+    move = (end - start) / start
 
-    if move_pct < MIN_MOVE_PCT:
+    if move < MIN_MOVE_PCT:
         return None
 
     if recent["volume"].iloc[-1] < MIN_VOLUME:
         return None
 
-    vw = vwap(recent)
-    if price_now < vw:
-        return None
-
-    score = move_pct * 100  # simple, aggressive
-
     return {
         "symbol": symbol,
-        "price": float(price_now),
-        "score": float(score)
+        "price": float(end),
+        "score": float(move)
     }
 
 # ================= ORDER =================
-def position_size(price):
+def calc_qty(price):
     eq = equity()
-    risk_dollars = eq * RISK_PER_TRADE
-    per_share_risk = price * STOP_LOSS_PCT
-    qty = int(risk_dollars / per_share_risk)
+    risk = eq * RISK_PER_TRADE
+    per_share = price * SL_PCT
+    qty = int(risk / per_share)
     return max(1, qty)
 
 def submit_trade(symbol, price):
-    qty = position_size(price)
+    qty = calc_qty(price)
 
-    tp = round(price * (1 + TAKE_PROFIT_PCT), 2)
-    sl = round(price * (1 - STOP_LOSS_PCT), 2)
+    tp = round(price * (1 + TP_PCT), 2)
+    sl = round(price * (1 - SL_PCT), 2)
 
     try:
         api.submit_order(
@@ -141,7 +128,7 @@ def submit_trade(symbol, price):
             take_profit={"limit_price": str(tp)},
             stop_loss={"stop_price": str(sl)}
         )
-        log(f"TRADE {symbol} qty={qty} tp={tp} sl={sl}")
+        log(f"ENTER {symbol} qty={qty} tp={tp} sl={sl}")
         return True
     except Exception as e:
         log(f"ORDER ERROR {symbol}: {e}")
@@ -156,25 +143,26 @@ def main():
         return
 
     if has_position():
-        log("Position open – skip")
+        log("Position open")
         return
 
-    candidates = []
+    signals = []
 
     for sym in SYMBOLS:
         try:
-            s = score_symbol(sym)
-            if s:
-                candidates.append(s)
+            sig = get_signal(sym)
+            if sig:
+                signals.append(sig)
         except Exception as e:
             log(f"{sym} error {e}")
 
-    if not candidates:
+    if not signals:
         log("No entries")
         return
 
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    best = candidates[0]
+    # Most aggressive momentum
+    signals.sort(key=lambda x: x["score"], reverse=True)
+    best = signals[0]
 
     submit_trade(best["symbol"], best["price"])
 
