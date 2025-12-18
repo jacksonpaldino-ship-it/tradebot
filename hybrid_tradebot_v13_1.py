@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 
 import os
-import math
 from datetime import datetime
 import pytz
-
 import pandas as pd
 import yfinance as yf
 from alpaca_trade_api.rest import REST
@@ -12,46 +10,35 @@ from alpaca_trade_api.rest import REST
 # ================= CONFIG =================
 SYMBOLS = ["SPY", "QQQ", "IWM", "DIA"]
 
-LOOKBACK_MIN = 15            # very short momentum
-MIN_MOVE_PCT = 0.0008        # 0.08% move (EXTREMELY EASY)
-RISK_PER_TRADE = 0.015       # 1.5%
-TP_PCT = 0.0025              # 0.25%
-SL_PCT = 0.0018              # 0.18%
+LOOKBACK = 3                 # EXTREMELY SHORT
+RANGE_TRIGGER = 0.0006       # 0.06% 3-min range
+BREAKOUT_TRIGGER = 0.0002    # 0.02% micro breakout
 
-MIN_VOLUME = 1000
+TP_PCT = 0.0015              # 0.15%
+SL_PCT = 0.0012              # 0.12%
+RISK_PER_TRADE = 0.02        # 2%
+
 TZ = pytz.timezone("US/Eastern")
 
 # ================= ALPACA =================
-API_KEY = os.getenv("ALPACA_API_KEY")
-API_SECRET = os.getenv("ALPACA_SECRET_KEY")
-BASE_URL = os.getenv("ALPACA_BASE_URL")
-
-if not API_KEY or not API_SECRET or not BASE_URL:
-    raise RuntimeError("Missing Alpaca credentials")
-
-api = REST(API_KEY, API_SECRET, BASE_URL)
+api = REST(
+    os.getenv("ALPACA_API_KEY"),
+    os.getenv("ALPACA_SECRET_KEY"),
+    os.getenv("ALPACA_BASE_URL"),
+)
 
 # ================= UTILS =================
 def log(msg):
     print(f"{datetime.now(TZ)} {msg}")
 
 def market_open():
-    try:
-        return api.get_clock().is_open
-    except:
-        return False
+    return api.get_clock().is_open
 
 def has_position():
-    try:
-        return len(api.list_positions()) > 0
-    except:
-        return False
+    return len(api.list_positions()) > 0
 
 def equity():
-    try:
-        return float(api.get_account().equity)
-    except:
-        return 0.0
+    return float(api.get_account().equity)
 
 # ================= DATA =================
 def fetch(symbol):
@@ -59,56 +46,55 @@ def fetch(symbol):
         symbol,
         period="1d",
         interval="1m",
+        auto_adjust=True,
         progress=False,
-        auto_adjust=True
     )
 
     if df is None or df.empty:
         return None
 
-    # 🔧 FIX: flatten MultiIndex columns
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0].lower() for c in df.columns]
     else:
         df.columns = [str(c).lower() for c in df.columns]
 
-    required = {"open", "high", "low", "close", "volume"}
+    required = {"open", "high", "low", "close"}
     if not required.issubset(df.columns):
         return None
 
-    df = df.dropna()
-    return df.tail(LOOKBACK_MIN + 5)
+    return df.dropna().tail(LOOKBACK + 1)
 
 # ================= SIGNAL =================
 def get_signal(symbol):
     df = fetch(symbol)
-    if df is None or len(df) < LOOKBACK_MIN:
+    if df is None or len(df) < LOOKBACK:
         return None
 
-    recent = df.tail(LOOKBACK_MIN)
+    recent = df.tail(LOOKBACK)
 
-    start = recent["close"].iloc[0]
-    end = recent["close"].iloc[-1]
-    move = (end - start) / start
+    high = recent["high"].max()
+    low = recent["low"].min()
+    last = recent["close"].iloc[-1]
 
-    if move < MIN_MOVE_PCT:
-        return None
+    range_pct = (high - low) / last
+    breakout_up = last > high * (1 - BREAKOUT_TRIGGER)
 
-    if recent["volume"].iloc[-1] < MIN_VOLUME:
-        return None
+    # PURE ACTIVITY LOGIC
+    if range_pct > RANGE_TRIGGER or breakout_up:
+        score = range_pct
+        return {
+            "symbol": symbol,
+            "price": float(last),
+            "score": float(score),
+        }
 
-    return {
-        "symbol": symbol,
-        "price": float(end),
-        "score": float(move)
-    }
+    return None
 
 # ================= ORDER =================
 def calc_qty(price):
-    eq = equity()
-    risk = eq * RISK_PER_TRADE
+    risk_dollars = equity() * RISK_PER_TRADE
     per_share = price * SL_PCT
-    qty = int(risk / per_share)
+    qty = int(risk_dollars / per_share)
     return max(1, qty)
 
 def submit_trade(symbol, price):
@@ -126,13 +112,11 @@ def submit_trade(symbol, price):
             time_in_force="day",
             order_class="bracket",
             take_profit={"limit_price": str(tp)},
-            stop_loss={"stop_price": str(sl)}
+            stop_loss={"stop_price": str(sl)},
         )
         log(f"ENTER {symbol} qty={qty} tp={tp} sl={sl}")
-        return True
     except Exception as e:
         log(f"ORDER ERROR {symbol}: {e}")
-        return False
 
 # ================= MAIN =================
 def main():
@@ -160,7 +144,7 @@ def main():
         log("No entries")
         return
 
-    # Most aggressive momentum
+    # TAKE MOST ACTIVE SYMBOL
     signals.sort(key=lambda x: x["score"], reverse=True)
     best = signals[0]
 
