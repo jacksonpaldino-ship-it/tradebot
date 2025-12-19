@@ -92,9 +92,11 @@ def get_signal(symbol):
 
 # ================= ORDER =================
 def calc_qty(price):
-    risk_dollars = equity() * RISK_PER_TRADE
-    per_share = price * SL_PCT
-    qty = int(risk_dollars / per_share)
+    eq = equity()
+
+    max_position_value = eq * 0.25   # 25% of account, aggressive but feasible
+    qty = int(max_position_value / price)
+
     return max(1, qty)
 
 def submit_trade(symbol, price):
