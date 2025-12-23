@@ -2,8 +2,10 @@ name: TradeBot
 
 on:
   schedule:
-    - cron: "*/10 14-21 * * 1-5"   # Every 10 minutes ET (market hours)
-  workflow_dispatch:
+    # Every minute from 9:35 to 15:30 ET (market hours)
+    - cron: "35-59 13 * * 1-5"   # 9:35–9:59 ET
+    - cron: "0-59 14-19 * * 1-5" # 10:00–15:59 ET
+  workflow_dispatch:  # allow manual runs
 
 jobs:
   run-bot:
