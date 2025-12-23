@@ -4,16 +4,15 @@ import os
 import math
 from datetime import datetime, date
 import pytz
-
 import pandas as pd
 import yfinance as yf
-from alpaca_trade_api.rest import REST, TimeFrame
+from alpaca_trade_api.rest import REST
 
 # ================= CONFIG =================
 SYMBOLS = ["SPY", "QQQ", "IWM", "DIA"]
 
 LOOKBACK_MIN = 5
-MIN_MOVE_PCT = 0.00035        # tuned
+MIN_MOVE_PCT = 0.00035        # tuned for frequency
 MIN_VOLUME = 500
 
 TP_PCT = 0.0015               # 0.15%
@@ -21,7 +20,7 @@ SL_PCT = 0.0012               # 0.12%
 
 RISK_PER_TRADE = 0.005        # 0.5% risk
 MAX_POSITION_PCT = 0.15       # max 15% equity
-MAX_DAILY_LOSS_PCT = 0.02     # 2% daily loss lock
+MAX_DAILY_LOSS_PCT = 0.02     # 2% daily lock
 
 TZ = pytz.timezone("US/Eastern")
 
@@ -46,10 +45,16 @@ def market_open():
         return False
 
 def within_trade_window():
-    now = datetime.now(TZ).time()
+    now = datetime.now(TZ)
+
+    # Weekend lock
+    if now.weekday() >= 5:
+        return False
+
+    t = now.time()
     return (
-        now >= datetime.strptime("09:35", "%H:%M").time() and
-        now <= datetime.strptime("15:45", "%H:%M").time()
+        t >= datetime.strptime("09:35", "%H:%M").time() and
+        t <= datetime.strptime("15:45", "%H:%M").time()
     )
 
 def equity():
@@ -62,10 +67,7 @@ def buying_power():
 def daily_loss_exceeded():
     today = date.today().isoformat()
     try:
-        activities = api.get_activities(
-            activity_types="FILL",
-            after=today
-        )
+        activities = api.get_activities(activity_types="FILL", after=today)
     except Exception as e:
         log(f"Activity fetch error: {e}")
         return False
@@ -78,7 +80,7 @@ def daily_loss_exceeded():
     loss_limit = -equity() * MAX_DAILY_LOSS_PCT
 
     if realized_pnl <= loss_limit:
-        log(f"DAILY LOSS LOCK HIT: PnL={realized_pnl:.2f}")
+        log(f"DAILY LOSS LOCK HIT: {realized_pnl:.2f}")
         return True
 
     return False
@@ -122,12 +124,11 @@ def get_signal(symbol):
     if move < MIN_MOVE_PCT:
         return None
 
-    avg_vol = recent["volume"].mean()
-    if avg_vol < MIN_VOLUME:
+    if recent["volume"].mean() < MIN_VOLUME:
         return None
 
-    green_candles = (recent["close"] > recent["open"]).sum()
-    if green_candles < 3:
+    green = (recent["close"] > recent["open"]).sum()
+    if green < 3:
         return None
 
     return {
@@ -139,7 +140,6 @@ def get_signal(symbol):
 # ================= ORDER =================
 def calc_qty(price):
     eq = equity()
-    bp = buying_power()
 
     risk_dollars = eq * RISK_PER_TRADE
     per_share_risk = price * SL_PCT
@@ -148,8 +148,7 @@ def calc_qty(price):
     max_position_value = eq * MAX_POSITION_PCT
     qty_cap = math.floor(max_position_value / price)
 
-    qty = min(qty_risk, qty_cap)
-    return max(1, qty)
+    return max(1, min(qty_risk, qty_cap))
 
 def round_price(p):
     return round(p, 2)
