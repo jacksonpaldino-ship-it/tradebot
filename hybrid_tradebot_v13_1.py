@@ -101,9 +101,13 @@ def fetch(symbol):
     if df is None or df.empty:
         return None
 
-    df.columns = [c.lower() for c in df.columns]
-    df = df.dropna()
+    # Flatten columns safely
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0].lower() for c in df.columns]
+    else:
+        df.columns = [str(c).lower() for c in df.columns]
 
+    df = df.dropna()
     return df.tail(LOOKBACK_MIN + 2)
 
 # ================= SIGNAL =================
