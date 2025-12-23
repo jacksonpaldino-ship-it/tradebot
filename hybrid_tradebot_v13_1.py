@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 
 import os
-from datetime import datetime
+import math
+from datetime import datetime, time
 import pytz
 import pandas as pd
 import yfinance as yf
 from alpaca_trade_api.rest import REST
 
 # ================= CONFIG =================
-SYMBOLS = ["SPY", "QQQ", "IWM", "DIA"]
+SYMBOLS = ["SPY", "QQQ", "IWM"]
 
-LOOKBACK = 3                 # EXTREMELY SHORT
-RANGE_TRIGGER = 0.0006       # 0.06% 3-min range
-BREAKOUT_TRIGGER = 0.0002    # 0.02% micro breakout
+OPEN_RANGE_START = time(9, 30)
+OPEN_RANGE_END   = time(9, 45)
+SESSION_END      = time(15, 30)
 
-TP_PCT = 0.0015              # 0.15%
-SL_PCT = 0.0012              # 0.12%
-RISK_PER_TRADE = 0.02        # 2%
+RISK_PER_TRADE = 0.005   # 0.5% per trade
+R_MULTIPLE = 2.5          # Target multiple of risk
+MAX_TRADES_PER_SYMBOL = 1  # one trade per symbol per day in cron
 
 TZ = pytz.timezone("US/Eastern")
 
@@ -24,133 +25,158 @@ TZ = pytz.timezone("US/Eastern")
 api = REST(
     os.getenv("ALPACA_API_KEY"),
     os.getenv("ALPACA_SECRET_KEY"),
-    os.getenv("ALPACA_BASE_URL"),
+    os.getenv("ALPACA_BASE_URL")
 )
 
 # ================= UTILS =================
 def log(msg):
-    print(f"{datetime.now(TZ)} {msg}")
+    print(f"{datetime.now(TZ)} {msg}", flush=True)
 
 def market_open():
-    return api.get_clock().is_open
-
-def has_position():
-    return len(api.list_positions()) > 0
+    try:
+        return api.get_clock().is_open
+    except:
+        return False
 
 def equity():
-    return float(api.get_account().equity)
+    try:
+        return float(api.get_account().equity)
+    except:
+        return 0.0
+
+def positions():
+    return {p.symbol: p for p in api.list_positions()}
+
+def trades_today(symbol):
+    today = datetime.now(TZ).date()
+    orders = api.list_orders(status="closed", limit=100)
+    return [o for o in orders if o.symbol == symbol and o.filled_at and o.filled_at.date() == today]
 
 # ================= DATA =================
-def fetch(symbol):
+def fetch_intraday(symbol):
     df = yf.download(
         symbol,
         period="1d",
         interval="1m",
         auto_adjust=True,
-        progress=False,
+        progress=False
     )
-
     if df is None or df.empty:
         return None
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0].lower() for c in df.columns]
-    else:
-        df.columns = [str(c).lower() for c in df.columns]
+    df = df.rename(columns=str.lower)
+    df.index = df.index.tz_localize("UTC").tz_convert(TZ)
 
-    required = {"open", "high", "low", "close"}
-    if not required.issubset(df.columns):
-        return None
+    # VWAP
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    df["vwap"] = (tp * df["volume"]).cumsum() / df["volume"].cumsum()
 
-    return df.dropna().tail(LOOKBACK + 1)
+    return df.dropna()
+
+def opening_range(df):
+    or_df = df.between_time(OPEN_RANGE_START, OPEN_RANGE_END)
+    if or_df.empty:
+        return None, None
+    return or_df["high"].max(), or_df["low"].min()
 
 # ================= SIGNAL =================
 def get_signal(symbol):
-    df = fetch(symbol)
-    if df is None or len(df) < LOOKBACK:
+    now = datetime.now(TZ).time()
+    if now < OPEN_RANGE_END or now > SESSION_END:
         return None
 
-    recent = df.tail(LOOKBACK)
+    df = fetch_intraday(symbol)
+    if df is None:
+        return None
 
-    high = recent["high"].max()
-    low = recent["low"].min()
-    last = recent["close"].iloc[-1]
+    orb_high, orb_low = opening_range(df)
+    if orb_high is None:
+        return None
 
-    range_pct = (high - low) / last
-    breakout_up = last > high * (1 - BREAKOUT_TRIGGER)
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
 
-    # PURE ACTIVITY LOGIC
-    if range_pct > RANGE_TRIGGER or breakout_up:
-        score = range_pct
-        return {
-            "symbol": symbol,
-            "price": float(last),
-            "score": float(score),
-        }
+    price = last["close"]
+    vwap = last["vwap"]
+
+    # check if symbol already traded today
+    if len(trades_today(symbol)) >= MAX_TRADES_PER_SYMBOL:
+        return None
+
+    # check if symbol already has open position
+    if symbol in positions():
+        return None
+
+    # ORB breakout
+    if price > orb_high:
+        return {"symbol": symbol, "entry": price, "stop": orb_low}
+
+    # VWAP continuation (price crosses VWAP upward)
+    if price > vwap and prev["close"] <= vwap:
+        return {"symbol": symbol, "entry": price, "stop": vwap}
 
     return None
 
-# ================= ORDER =================
-def calc_qty(price):
+# ================= POSITION SIZING =================
+def calc_qty(entry, stop):
     eq = equity()
-
-    max_position_value = eq * 0.25   # 25% of account, aggressive but feasible
-    qty = int(max_position_value / price)
-
+    if eq <= 0:
+        return 0
+    risk_per_share = entry - stop
+    if risk_per_share <= 0:
+        return 0
+    risk_dollars = eq * RISK_PER_TRADE
+    qty = int(risk_dollars / risk_per_share)
     return max(1, qty)
 
-def submit_trade(symbol, price):
-    qty = calc_qty(price)
+def round_price(p):
+    return round(p, 2)
 
-    tp = round(price * (1 + TP_PCT), 2)
-    sl = round(price * (1 - SL_PCT), 2)
+# ================= ORDER =================
+def submit_trade(signal):
+    entry = signal["entry"]
+    stop = signal["stop"]
+    qty = calc_qty(entry, stop)
+    if qty <= 0:
+        log(f"Skip {signal['symbol']}: qty=0")
+        return False
+
+    target = round_price(entry + (entry - stop) * R_MULTIPLE)
 
     try:
         api.submit_order(
-            symbol=symbol,
+            symbol=signal["symbol"],
             qty=qty,
             side="buy",
             type="market",
             time_in_force="day",
             order_class="bracket",
-            take_profit={"limit_price": str(tp)},
-            stop_loss={"stop_price": str(sl)},
+            take_profit={"limit_price": str(target)},
+            stop_loss={"stop_price": str(round_price(stop))}
         )
-        log(f"ENTER {symbol} qty={qty} tp={tp} sl={sl}")
+        log(f"ENTER {signal['symbol']} qty={qty} target={target} stop={stop}")
+        return True
     except Exception as e:
-        log(f"ORDER ERROR {symbol}: {e}")
+        log(f"ORDER ERROR {signal['symbol']}: {e}")
+        return False
 
 # ================= MAIN =================
 def main():
-    log("Run start")
+    log("GitHub Actions run start")
 
     if not market_open():
         log("Market closed")
         return
 
-    if has_position():
-        log("Position open")
-        return
-
-    signals = []
-
     for sym in SYMBOLS:
         try:
             sig = get_signal(sym)
             if sig:
-                signals.append(sig)
+                submit_trade(sig)
+                # one trade per run to avoid duplicate entries in cron
+                break
         except Exception as e:
-            log(f"{sym} error {e}")
-
-    if not signals:
-        log("No entries")
-        return
-
-    # TAKE MOST ACTIVE SYMBOL
-    signals.sort(key=lambda x: x["score"], reverse=True)
-    best = signals[0]
-
-    submit_trade(best["symbol"], best["price"])
+            log(f"{sym} error: {e}")
 
 if __name__ == "__main__":
     main()
