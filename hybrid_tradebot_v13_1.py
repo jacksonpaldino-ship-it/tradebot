@@ -2,37 +2,42 @@
 
 import os
 import math
-from datetime import datetime, time
+from datetime import datetime, date
 import pytz
+
 import pandas as pd
 import yfinance as yf
-from alpaca_trade_api.rest import REST
+from alpaca_trade_api.rest import REST, TimeFrame
 
 # ================= CONFIG =================
-SYMBOLS = ["SPY", "QQQ", "IWM"]
+SYMBOLS = ["SPY", "QQQ", "IWM", "DIA"]
 
-OPEN_RANGE_START = time(9, 30)
-OPEN_RANGE_END   = time(9, 45)
-SESSION_END      = time(15, 30)
+LOOKBACK_MIN = 5
+MIN_MOVE_PCT = 0.00035        # tuned
+MIN_VOLUME = 500
 
-RISK_PER_TRADE = 0.004        # 0.4% per trade (cron-safe)
-R_MULTIPLE = 2.5
-MAX_TRADES_PER_SYMBOL = 1     # HARD cap
+TP_PCT = 0.0015               # 0.15%
+SL_PCT = 0.0012               # 0.12%
 
-MAX_POSITION_PCT = 0.15       # 15% equity max
+RISK_PER_TRADE = 0.005        # 0.5% risk
+MAX_POSITION_PCT = 0.15       # max 15% equity
+MAX_DAILY_LOSS_PCT = 0.02     # 2% daily loss lock
 
 TZ = pytz.timezone("US/Eastern")
 
 # ================= ALPACA =================
-api = REST(
-    os.getenv("ALPACA_API_KEY"),
-    os.getenv("ALPACA_SECRET_KEY"),
-    os.getenv("ALPACA_BASE_URL"),
-)
+API_KEY = os.getenv("ALPACA_API_KEY")
+API_SECRET = os.getenv("ALPACA_SECRET_KEY")
+BASE_URL = os.getenv("ALPACA_BASE_URL")
+
+if not API_KEY or not API_SECRET or not BASE_URL:
+    raise RuntimeError("Missing Alpaca credentials")
+
+api = REST(API_KEY, API_SECRET, BASE_URL)
 
 # ================= UTILS =================
 def log(msg):
-    print(f"{datetime.now(TZ)} {msg}", flush=True)
+    print(f"{datetime.now(TZ)} {msg}")
 
 def market_open():
     try:
@@ -40,31 +45,46 @@ def market_open():
     except:
         return False
 
+def within_trade_window():
+    now = datetime.now(TZ).time()
+    return (
+        now >= datetime.strptime("09:35", "%H:%M").time() and
+        now <= datetime.strptime("15:45", "%H:%M").time()
+    )
+
 def equity():
-    try:
-        return float(api.get_account().equity)
-    except:
-        return 0.0
+    return float(api.get_account().equity)
 
 def buying_power():
+    return float(api.get_account().buying_power)
+
+# ================= DAILY LOSS LOCK =================
+def daily_loss_exceeded():
+    today = date.today().isoformat()
     try:
-        return float(api.get_account().buying_power)
-    except:
-        return 0.0
+        activities = api.get_activities(
+            activity_types="FILL",
+            after=today
+        )
+    except Exception as e:
+        log(f"Activity fetch error: {e}")
+        return False
 
-def positions():
-    return {p.symbol: p for p in api.list_positions()}
+    realized_pnl = 0.0
+    for act in activities:
+        if act.side == "sell":
+            realized_pnl += float(act.realized_pl)
 
-def trades_today(symbol):
-    today = datetime.now(TZ).date()
-    orders = api.list_orders(status="closed", limit=100)
-    return [
-        o for o in orders
-        if o.symbol == symbol and o.filled_at and o.filled_at.date() == today
-    ]
+    loss_limit = -equity() * MAX_DAILY_LOSS_PCT
+
+    if realized_pnl <= loss_limit:
+        log(f"DAILY LOSS LOCK HIT: PnL={realized_pnl:.2f}")
+        return True
+
+    return False
 
 # ================= DATA =================
-def fetch_intraday(symbol):
+def fetch(symbol):
     df = yf.download(
         symbol,
         period="1d",
@@ -72,122 +92,128 @@ def fetch_intraday(symbol):
         auto_adjust=True,
         progress=False
     )
+
     if df is None or df.empty:
         return None
 
-    df = df.rename(columns=str.lower)
-    df.index = df.index.tz_localize("UTC").tz_convert(TZ)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0].lower() for c in df.columns]
+    else:
+        df.columns = [str(c).lower() for c in df.columns]
 
-    tp = (df["high"] + df["low"] + df["close"]) / 3
-    df["vwap"] = (tp * df["volume"]).cumsum() / df["volume"].cumsum()
+    required = {"open", "high", "low", "close", "volume"}
+    if not required.issubset(df.columns):
+        return None
 
-    return df.dropna()
-
-def opening_range(df):
-    or_df = df.between_time(OPEN_RANGE_START, OPEN_RANGE_END)
-    if or_df.empty:
-        return None, None
-    return or_df["high"].max(), or_df["low"].min()
+    return df.dropna().tail(LOOKBACK_MIN + 2)
 
 # ================= SIGNAL =================
 def get_signal(symbol):
-    now = datetime.now(TZ).time()
-    if now < OPEN_RANGE_END or now > SESSION_END:
+    df = fetch(symbol)
+    if df is None or len(df) < LOOKBACK_MIN:
         return None
 
-    if symbol in positions():
+    recent = df.tail(LOOKBACK_MIN)
+
+    start = recent["close"].iloc[0]
+    end = recent["close"].iloc[-1]
+    move = (end - start) / start
+
+    if move < MIN_MOVE_PCT:
         return None
 
-    if len(trades_today(symbol)) >= MAX_TRADES_PER_SYMBOL:
+    avg_vol = recent["volume"].mean()
+    if avg_vol < MIN_VOLUME:
         return None
 
-    df = fetch_intraday(symbol)
-    if df is None or len(df) < 20:
+    green_candles = (recent["close"] > recent["open"]).sum()
+    if green_candles < 3:
         return None
 
-    orb_high, orb_low = opening_range(df)
-    if orb_high is None:
-        return None
+    return {
+        "symbol": symbol,
+        "price": float(end),
+        "score": float(move)
+    }
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    price = last["close"]
-    vwap = last["vwap"]
-
-    # ORB breakout (primary)
-    if price > orb_high:
-        return {"symbol": symbol, "entry": price, "stop": orb_low}
-
-    # VWAP continuation (only if ORB already broken earlier)
-    if price > vwap and prev["close"] <= vwap and df["high"].max() > orb_high:
-        return {"symbol": symbol, "entry": price, "stop": vwap}
-
-    return None
-
-# ================= POSITION SIZING =================
-def calc_qty(entry, stop):
+# ================= ORDER =================
+def calc_qty(price):
     eq = equity()
     bp = buying_power()
 
-    if eq <= 0 or bp <= 0:
-        return 0
-
-    risk_per_share = entry - stop
-    if risk_per_share <= 0:
-        return 0
-
     risk_dollars = eq * RISK_PER_TRADE
-    qty_risk = math.floor(risk_dollars / risk_per_share)
+    per_share_risk = price * SL_PCT
+    qty_risk = math.floor(risk_dollars / per_share_risk)
 
     max_position_value = eq * MAX_POSITION_PCT
-    qty_cap = math.floor(max_position_value / entry)
+    qty_cap = math.floor(max_position_value / price)
 
-    return max(1, min(qty_risk, qty_cap))
+    qty = min(qty_risk, qty_cap)
+    return max(1, qty)
 
-def rp(p):
+def round_price(p):
     return round(p, 2)
 
-# ================= ORDER =================
-def submit_trade(sig):
-    qty = calc_qty(sig["entry"], sig["stop"])
+def submit_trade(symbol, price):
+    qty = calc_qty(price)
     if qty <= 0:
         return False
 
-    target = rp(sig["entry"] + (sig["entry"] - sig["stop"]) * R_MULTIPLE)
+    tp = round_price(price * (1 + TP_PCT))
+    sl = round_price(price * (1 - SL_PCT))
 
     try:
         api.submit_order(
-            symbol=sig["symbol"],
+            symbol=symbol,
             qty=qty,
             side="buy",
             type="market",
             time_in_force="day",
             order_class="bracket",
-            take_profit={"limit_price": str(target)},
-            stop_loss={"stop_price": str(rp(sig["stop"]))}
+            take_profit={"limit_price": str(tp)},
+            stop_loss={"stop_price": str(sl)}
         )
-        log(f"ENTER {sig['symbol']} qty={qty} target={target} stop={sig['stop']}")
+        log(f"ENTER {symbol} qty={qty} tp={tp} sl={sl}")
         return True
     except Exception as e:
-        log(f"ORDER ERROR {sig['symbol']}: {e}")
+        log(f"ORDER ERROR {symbol}: {e}")
         return False
 
 # ================= MAIN =================
 def main():
-    log("Cron run start")
+    log("Run start")
 
     if not market_open():
+        log("Market closed")
         return
+
+    if not within_trade_window():
+        log("Outside trade window")
+        return
+
+    if daily_loss_exceeded():
+        log("Trading locked for the day")
+        return
+
+    signals = []
 
     for sym in SYMBOLS:
         try:
             sig = get_signal(sym)
             if sig:
-                submit_trade(sig)
-                break  # ONE trade per cron run
+                signals.append(sig)
         except Exception as e:
             log(f"{sym} error {e}")
+
+    if not signals:
+        log("No entries")
+        return
+
+    signals.sort(key=lambda x: x["score"], reverse=True)
+
+    for sig in signals:
+        if submit_trade(sig["symbol"], sig["price"]):
+            break
 
 if __name__ == "__main__":
     main()
