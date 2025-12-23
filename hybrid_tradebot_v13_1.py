@@ -2,9 +2,8 @@
 
 import os
 import math
-from datetime import datetime, time
+from datetime import datetime, time, date
 import pytz
-
 import pandas as pd
 import yfinance as yf
 from alpaca_trade_api.rest import REST
@@ -31,8 +30,7 @@ TZ = pytz.timezone("US/Eastern")
 
 # Trade windows (ET)
 TRADE_WINDOWS = [
-    (time(9, 30), time(10, 30)),
-    (time(13, 30), time(15, 30)),
+    (time(9, 35), time(15, 45)),
 ]
 
 # ================= ALPACA =================
@@ -64,6 +62,8 @@ def current_time_allowed():
     now = datetime.now(TZ).time()
     return any(start <= now <= end for start, end in TRADE_WINDOWS)
 
+# ================= DAILY LOSS LOCK =================
+
 def daily_pnl():
     today = datetime.now(TZ).date()
     try:
@@ -74,12 +74,13 @@ def daily_pnl():
 
     pnl = 0.0
     for a in activities:
-        # Only count today’s trades
-        act_time = datetime.strptime(a.transaction_time, "%Y-%m-%dT%H:%M:%S.%fZ").date()
+        act_time = a.transaction_time
+        if not isinstance(act_time, date):
+            act_time = pd.to_datetime(act_time).date()
+
         if act_time != today:
             continue
 
-        # Use realized_pl for filled trades
         realized = getattr(a, "realized_pl", None)
         if realized is not None:
             pnl += float(realized)
@@ -138,8 +139,6 @@ def get_signal(symbol):
 
 def calc_qty(price):
     eq = equity()
-    bp = buying_power()
-
     risk_dollars = eq * RISK_PER_TRADE
     per_share_risk = price * SL_PCT
     qty_risk = math.floor(risk_dollars / per_share_risk)
