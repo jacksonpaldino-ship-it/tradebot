@@ -66,11 +66,24 @@ def current_time_allowed():
 
 def daily_pnl():
     today = datetime.now(TZ).date()
-    activities = api.get_activities(activity_types="FILL")
+    try:
+        activities = api.get_activities(activity_types="FILL")
+    except Exception as e:
+        log(f"Activity fetch error: {e}")
+        return 0.0
+
     pnl = 0.0
     for a in activities:
-        if a.transaction_time.date() == today:
-            pnl += float(a.net_amount)
+        # Only count today’s trades
+        act_time = datetime.strptime(a.transaction_time, "%Y-%m-%dT%H:%M:%S.%fZ").date()
+        if act_time != today:
+            continue
+
+        # Use realized_pl for filled trades
+        realized = getattr(a, "realized_pl", None)
+        if realized is not None:
+            pnl += float(realized)
+
     return pnl
 
 # ================= DATA =================
