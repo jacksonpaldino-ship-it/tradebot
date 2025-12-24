@@ -15,20 +15,19 @@ SYMBOLS = [
     "XLK", "XLF", "XLE", "XLV", "XLY"
 ]
 
-LOOKBACK_MIN = 3               # shorter momentum window
-MIN_MOVE_PCT = 0.00035         # 0.035%
-TP_PCT = 0.0015                # 0.15%
-SL_PCT = 0.0012                # 0.12%
+LOOKBACK_MIN = 3
+MIN_MOVE_PCT = 0.00035
 
-RISK_PER_TRADE = 0.005         # 0.5% equity risk
-MAX_POSITION_PCT = 0.15        # max 15% equity per trade
-MAX_TRADES_PER_RUN = 2         # increase frequency safely
+TP_PCT = 0.0015
+SL_PCT = 0.0012
 
-DAILY_LOSS_LIMIT_PCT = 0.02    # 2% max daily loss
+RISK_PER_TRADE = 0.005        # 0.5% equity
+MAX_POSITION_PCT = 0.15       # hard cap
+
+DAILY_LOSS_LIMIT_PCT = 0.02   # 2% max daily loss
 
 TZ = pytz.timezone("US/Eastern")
 
-# Trade windows (ET)
 TRADE_WINDOWS = [
     (time(9, 35), time(15, 45)),
 ]
@@ -62,29 +61,41 @@ def current_time_allowed():
     now = datetime.now(TZ).time()
     return any(start <= now <= end for start, end in TRADE_WINDOWS)
 
-# ================= DAILY LOSS LOCK =================
+# ================= HARD LOCKS =================
+
+def has_any_position():
+    try:
+        return len(api.list_positions()) > 0
+    except:
+        return False
+
+def traded_today(symbol):
+    today = datetime.now(TZ).date()
+    try:
+        acts = api.get_activities(activity_types="FILL")
+    except:
+        return False
+
+    for a in acts:
+        act_time = pd.to_datetime(a.transaction_time).date()
+        if act_time == today and a.symbol == symbol:
+            return True
+    return False
 
 def daily_pnl():
     today = datetime.now(TZ).date()
+    pnl = 0.0
     try:
-        activities = api.get_activities(activity_types="FILL")
-    except Exception as e:
-        log(f"Activity fetch error: {e}")
+        acts = api.get_activities(activity_types="FILL")
+    except:
         return 0.0
 
-    pnl = 0.0
-    for a in activities:
-        act_time = a.transaction_time
-        if not isinstance(act_time, date):
-            act_time = pd.to_datetime(act_time).date()
-
-        if act_time != today:
-            continue
-
-        realized = getattr(a, "realized_pl", None)
-        if realized is not None:
-            pnl += float(realized)
-
+    for a in acts:
+        act_time = pd.to_datetime(a.transaction_time).date()
+        if act_time == today:
+            realized = getattr(a, "realized_pl", None)
+            if realized is not None:
+                pnl += float(realized)
     return pnl
 
 # ================= DATA =================
@@ -101,7 +112,6 @@ def fetch(symbol):
     if df is None or df.empty:
         return None
 
-    # Flatten columns safely
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0].lower() for c in df.columns]
     else:
@@ -130,13 +140,11 @@ def get_signal(symbol):
     if abs(move) < MIN_MOVE_PCT:
         return None
 
-    direction = "long" if move > 0 else "short"
-
     return {
         "symbol": symbol,
         "price": float(end),
-        "score": abs(move),
-        "side": direction
+        "side": "long" if move > 0 else "short",
+        "score": abs(move)
     }
 
 # ================= ORDER =================
@@ -147,11 +155,10 @@ def calc_qty(price):
     per_share_risk = price * SL_PCT
     qty_risk = math.floor(risk_dollars / per_share_risk)
 
-    max_position_value = eq * MAX_POSITION_PCT
-    qty_cap = math.floor(max_position_value / price)
+    max_value = eq * MAX_POSITION_PCT
+    qty_cap = math.floor(max_value / price)
 
-    qty = min(qty_risk, qty_cap)
-    return max(1, qty)
+    return max(1, min(qty_risk, qty_cap))
 
 def round_price(p):
     return round(p, 2)
@@ -161,18 +168,26 @@ def submit_trade(sig):
     price = sig["price"]
     side = sig["side"]
 
+    if has_any_position():
+        log("Position already open — skipping")
+        return False
+
+    if traded_today(symbol):
+        log(f"{symbol} already traded today — skipping")
+        return False
+
     qty = calc_qty(price)
     if qty <= 0:
         return False
 
     if side == "long":
+        order_side = "buy"
         tp = round_price(price * (1 + TP_PCT))
         sl = round_price(price * (1 - SL_PCT))
-        order_side = "buy"
     else:
+        order_side = "sell"
         tp = round_price(price * (1 - TP_PCT))
         sl = round_price(price * (1 + SL_PCT))
-        order_side = "sell"
 
     try:
         api.submit_order(
@@ -183,9 +198,9 @@ def submit_trade(sig):
             time_in_force="day",
             order_class="bracket",
             take_profit={"limit_price": str(tp)},
-            stop_loss={"stop_price": str(sl)}
+            stop_loss={"stop_price": str(sl)},
         )
-        log(f"{side.upper()} {symbol} qty={qty} tp={tp} sl={sl}")
+        log(f"{side.upper()} ENTRY {symbol} qty={qty} tp={tp} sl={sl}")
         return True
     except Exception as e:
         log(f"ORDER ERROR {symbol}: {e}")
@@ -204,20 +219,19 @@ def main():
         log("Outside trade window")
         return
 
-    pnl = daily_pnl()
-    if pnl < -equity() * DAILY_LOSS_LIMIT_PCT:
+    if daily_pnl() < -equity() * DAILY_LOSS_LIMIT_PCT:
         log("Daily loss limit hit")
         return
 
-    signals = []
+    if has_any_position():
+        log("Position already open")
+        return
 
+    signals = []
     for sym in SYMBOLS:
-        try:
-            sig = get_signal(sym)
-            if sig:
-                signals.append(sig)
-        except Exception as e:
-            log(f"{sym} error {e}")
+        sig = get_signal(sym)
+        if sig:
+            signals.append(sig)
 
     if not signals:
         log("No signals")
@@ -225,12 +239,7 @@ def main():
 
     signals.sort(key=lambda x: x["score"], reverse=True)
 
-    trades = 0
-    for sig in signals:
-        if trades >= MAX_TRADES_PER_RUN:
-            break
-        if submit_trade(sig):
-            trades += 1
+    submit_trade(signals[0])
 
 if __name__ == "__main__":
     main()
