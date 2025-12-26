@@ -12,8 +12,8 @@ from alpaca_trade_api.rest import REST
 
 # ================= CONFIG =================
 SYMBOLS = ["SPY", "QQQ", "IWM", "DIA"]  # ETFs to trade
-LOOKBACK_MIN = 5                        # Aggressive lookback
-MIN_MOVE_PCT = 0.0004                    # Minimum momentum for entry
+LOOKBACK_MIN = 3                        # Aggressive lookback
+MIN_MOVE_PCT = 0.0003                    # Minimum momentum for entry
 RISK_PER_TRADE = 0.005                   # 0.5% equity per trade
 TP_PCT = 0.0015                          # 0.15% profit target
 SL_PCT = 0.0012                          # 0.12% stop loss
