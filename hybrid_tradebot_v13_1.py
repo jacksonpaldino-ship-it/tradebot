@@ -1,196 +1,135 @@
 import os
-import time
 import logging
-from datetime import datetime, time as dtime
+from datetime import datetime, time
 import pytz
+import alpaca_trade_api as tradeapi
+import pandas as pd
 
-from alpaca_trade_api import REST
-
-# =========================
+# =====================
 # CONFIG
-# =========================
-
-API_KEY = os.getenv("ALPACA_API_KEY")
-API_SECRET = os.getenv("ALPACA_SECRET_KEY")
-BASE_URL = "https://paper-api.alpaca.markets"
-
+# =====================
 SYMBOLS = ["XLE", "XLF", "XLV", "XLY", "IWM"]
+RISK_PER_TRADE = 0.01          # 1% equity
+TAKE_PROFIT_PCT = 0.003        # 0.30%
+STOP_LOSS_PCT = 0.002          # 0.20%
+MIN_MOVE_PCT = 0.001           # 0.10%
+BAR_LOOKBACK = 5               # 5 minutes
+MAX_TRADES_PER_RUN = 3
 
-NOTIONAL_PER_TRADE = 1000        # very small, aggressive testing
-MAX_TRADES_PER_DAY = 50
-MAX_DAILY_LOSS_PCT = 0.01        # 1%
-STOP_LOSS_PCT = 0.003            # 0.3%
-TAKE_PROFIT_PCT = 0.002          # 0.2%
-
-MIN_MOVE_PCT = 0.00015           # VERY aggressive
-LOOKBACK_MINUTES = 1
-
-TRADE_START = dtime(9, 30)
-TRADE_END = dtime(15, 55)
-
-SLEEP_SECONDS = 20               # aggressive polling
-
-# =========================
+# =====================
 # LOGGING
-# =========================
-
+# =====================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger()
 
-# =========================
+# =====================
 # API
-# =========================
+# =====================
+api = tradeapi.REST(
+    os.environ["ALPACA_API_KEY"],
+    os.environ["ALPACA_SECRET_KEY"],
+    os.environ["ALPACA_BASE_URL"],
+    api_version="v2",
+)
 
-api = REST(API_KEY, API_SECRET, BASE_URL)
-
-# =========================
-# STATE
-# =========================
-
-trade_count = 0
-starting_equity = None
-
-# =========================
+# =====================
 # HELPERS
-# =========================
-
-def ny_time():
-    return datetime.now(pytz.timezone("America/New_York"))
-
+# =====================
 def market_open():
-    now = ny_time().time()
-    return TRADE_START <= now <= TRADE_END
+    ny = pytz.timezone("America/New_York")
+    now = datetime.now(ny).time()
+    return time(9, 30) <= now <= time(15, 55)
 
-def get_equity():
-    return float(api.get_account().equity)
+def already_in_position(symbol):
+    return symbol in [p.symbol for p in api.list_positions()]
 
-def daily_loss_exceeded():
-    global starting_equity
-    equity = get_equity()
-    loss_pct = (starting_equity - equity) / starting_equity
-    if loss_pct >= MAX_DAILY_LOSS_PCT:
-        log.error(f"DAILY LOSS LIMIT HIT: {loss_pct:.2%}")
-        return True
-    return False
+def get_move(symbol):
+    bars = api.get_bars(symbol, tradeapi.TimeFrame.Minute, limit=BAR_LOOKBACK).df
+    if bars.empty or len(bars) < BAR_LOOKBACK:
+        return None
+    open_price = bars.iloc[0]["open"]
+    close_price = bars.iloc[-1]["close"]
+    return (close_price - open_price) / open_price
 
-def get_recent_move(symbol):
-    bars = api.get_bars(
-        symbol,
-        timeframe="1Min",
-        limit=LOOKBACK_MINUTES + 1
+def submit_bracket(symbol, side, qty, price):
+    if side == "buy":
+        tp = round(price * (1 + TAKE_PROFIT_PCT), 2)
+        sl = round(price * (1 - STOP_LOSS_PCT), 2)
+    else:
+        tp = round(price * (1 - TAKE_PROFIT_PCT), 2)
+        sl = round(price * (1 + STOP_LOSS_PCT), 2)
+
+    api.submit_order(
+        symbol=symbol,
+        qty=qty,
+        side=side,
+        type="market",
+        time_in_force="day",
+        order_class="bracket",
+        take_profit={"limit_price": tp},
+        stop_loss={"stop_price": sl},
     )
 
-    if len(bars) < 2:
-        return None
+# =====================
+# MAIN
+# =====================
+def main():
+    log.info("BOT START")
 
-    old = bars[0].c
-    new = bars[-1].c
-    return (new - old) / old
+    if not market_open():
+        log.info("Market closed — exit")
+        return
 
-def flatten(symbol):
-    try:
-        api.close_position(symbol)
-        log.info(f"FLATTENED {symbol}")
-    except Exception:
-        pass
+    account = api.get_account()
+    equity = float(account.equity)
+    log.info(f"Equity: {equity}")
 
-# =========================
-# MAIN LOOP
-# =========================
+    trades = 0
 
-def run():
-    global trade_count, starting_equity
-
-    starting_equity = get_equity()
-    log.info(f"STARTING EQUITY: {starting_equity}")
-
-    while True:
-        try:
-            if not market_open():
-                log.info("Market closed — sleeping")
-                time.sleep(60)
-                continue
-
-            if trade_count >= MAX_TRADES_PER_DAY:
-                log.warning("Max trades reached for day")
-                break
-
-            if daily_loss_exceeded():
-                break
-
-            for symbol in SYMBOLS:
-                move = get_recent_move(symbol)
-
-                if move is None:
-                    log.info(f"{symbol}: not enough data")
-                    continue
-
-                log.info(f"{symbol}: move {move:.4%}")
-
-                if abs(move) < MIN_MOVE_PCT:
-                    log.info(f"{symbol}: move too small — skip")
-                    continue
-
-                side = "buy" if move > 0 else "sell"
-
-                try:
-                    api.submit_order(
-                        symbol=symbol,
-                        notional=NOTIONAL_PER_TRADE,
-                        side=side,
-                        type="market",
-                        time_in_force="day",
-                    )
-                    trade_count += 1
-                    log.info(f"ORDER SENT {symbol} {side.upper()}")
-
-                    time.sleep(2)
-
-                    position = api.get_position(symbol)
-                    entry_price = float(position.avg_entry_price)
-
-                    if side == "buy":
-                        stop = entry_price * (1 - STOP_LOSS_PCT)
-                        target = entry_price * (1 + TAKE_PROFIT_PCT)
-                    else:
-                        stop = entry_price * (1 + STOP_LOSS_PCT)
-                        target = entry_price * (1 - TAKE_PROFIT_PCT)
-
-                    # simple manual exit loop
-                    while True:
-                        last = api.get_last_trade(symbol).price
-
-                        if side == "buy" and (last <= stop or last >= target):
-                            flatten(symbol)
-                            break
-
-                        if side == "sell" and (last >= stop or last <= target):
-                            flatten(symbol)
-                            break
-
-                        time.sleep(3)
-
-                except Exception as e:
-                    log.error(f"{symbol}: ORDER FAILED — {e}")
-
-            time.sleep(SLEEP_SECONDS)
-
-        except KeyboardInterrupt:
-            log.warning("MANUAL STOP")
+    for symbol in SYMBOLS:
+        if trades >= MAX_TRADES_PER_RUN:
             break
 
+        try:
+            if already_in_position(symbol):
+                log.info(f"{symbol}: already in position — skip")
+                continue
+
+            move = get_move(symbol)
+            if move is None:
+                log.info(f"{symbol}: insufficient data")
+                continue
+
+            log.info(f"{symbol}: move {move:.4%}")
+
+            if abs(move) < MIN_MOVE_PCT:
+                log.info(f"{symbol}: move too small — skip")
+                continue
+
+            side = "buy" if move > 0 else "sell"
+
+            last_bar = api.get_bars(symbol, tradeapi.TimeFrame.Minute, limit=1).df.iloc[-1]
+            price = last_bar["close"]
+
+            risk_dollars = equity * RISK_PER_TRADE
+            qty = int(risk_dollars / (price * STOP_LOSS_PCT))
+
+            if qty <= 0:
+                log.info(f"{symbol}: qty zero — skip")
+                continue
+
+            submit_bracket(symbol, side, qty, price)
+            log.info(f"{symbol}: ORDER SENT {side.upper()} {qty}")
+
+            trades += 1
+
         except Exception as e:
-            log.error(f"FATAL LOOP ERROR: {e}")
-            time.sleep(30)
+            log.error(f"{symbol}: ERROR — {e}")
 
-    log.info("BOT STOPPED")
-
-# =========================
-# RUN
-# =========================
+    log.info("BOT END")
 
 if __name__ == "__main__":
-    run()
+    main()
