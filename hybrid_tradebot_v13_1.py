@@ -1,228 +1,196 @@
-#!/usr/bin/env python3
-
 import os
-import math
-from datetime import datetime, timedelta
-import pytz
 import time
+import logging
+from datetime import datetime, time as dtime
+import pytz
 
-import pandas as pd
-import yfinance as yf
-from alpaca_trade_api.rest import REST
+from alpaca_trade_api import REST
 
-# ================= CONFIG =================
-SYMBOLS = ["SPY", "QQQ", "IWM", "DIA"]  # ETFs to trade
-LOOKBACK_MIN = 3                        # Aggressive lookback
-MIN_MOVE_PCT = 0.0003                    # Minimum momentum for entry
-RISK_PER_TRADE = 0.005                   # 0.5% equity per trade
-TP_PCT = 0.0015                          # 0.15% profit target
-SL_PCT = 0.0012                          # 0.12% stop loss
-MIN_VOLUME = 500                          # Minimum last candle volume
-MAX_POSITION_PCT = 0.15                  # 15% max equity per trade
-MAX_DAILY_LOSS = 200                      # Max daily loss in dollars
-MAX_TRADES_PER_DAY = 10                   # Max trades per day
-SYMBOL_COOLDOWN_MIN = 10                  # Min minutes between trades on same symbol
+# =========================
+# CONFIG
+# =========================
 
-TRADING_START = "09:30"
-TRADING_END = "15:30"                     # Only trade within market hours
-
-TZ = pytz.timezone("US/Eastern")
-
-# ================= ALPACA =================
 API_KEY = os.getenv("ALPACA_API_KEY")
 API_SECRET = os.getenv("ALPACA_SECRET_KEY")
-BASE_URL = os.getenv("ALPACA_BASE_URL")
+BASE_URL = "https://paper-api.alpaca.markets"
 
-if not API_KEY or not API_SECRET or not BASE_URL:
-    raise RuntimeError("Missing Alpaca credentials")
+SYMBOLS = ["XLE", "XLF", "XLV", "XLY", "IWM"]
+
+NOTIONAL_PER_TRADE = 1000        # very small, aggressive testing
+MAX_TRADES_PER_DAY = 50
+MAX_DAILY_LOSS_PCT = 0.01        # 1%
+STOP_LOSS_PCT = 0.003            # 0.3%
+TAKE_PROFIT_PCT = 0.002          # 0.2%
+
+MIN_MOVE_PCT = 0.00015           # VERY aggressive
+LOOKBACK_MINUTES = 1
+
+TRADE_START = dtime(9, 30)
+TRADE_END = dtime(15, 55)
+
+SLEEP_SECONDS = 20               # aggressive polling
+
+# =========================
+# LOGGING
+# =========================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger()
+
+# =========================
+# API
+# =========================
 
 api = REST(API_KEY, API_SECRET, BASE_URL)
 
-# ================= STATE =================
-last_trade_time = {}  # Tracks cooldown per symbol
-daily_trades_count = 0
-daily_loss_total = 0.0
+# =========================
+# STATE
+# =========================
 
-# ================= UTILS =================
-def log(msg):
-    print(f"{datetime.now(TZ)} {msg}")
+trade_count = 0
+starting_equity = None
+
+# =========================
+# HELPERS
+# =========================
+
+def ny_time():
+    return datetime.now(pytz.timezone("America/New_York"))
 
 def market_open():
-    try:
-        clock = api.get_clock()
-        if not clock.is_open:
-            log(f"Market closed — next open {clock.next_open}")
-        return clock.is_open
-    except Exception as e:
-        log(f"Clock error: {e}")
-        return False
+    now = ny_time().time()
+    return TRADE_START <= now <= TRADE_END
 
-def equity():
-    try:
-        return float(api.get_account().equity)
-    except:
-        return 0.0
+def get_equity():
+    return float(api.get_account().equity)
 
-def buying_power():
-    try:
-        return float(api.get_account().buying_power)
-    except:
-        return 0.0
-
-def daily_pnl():
-    global daily_loss_total
-    try:
-        activities = api.get_activities(activity_types=["FILL"])
-        pnl = 0.0
-        today = datetime.now(TZ).date()
-        for a in activities:
-            act_time = a.transaction_time
-            if hasattr(act_time, "date"):
-                act_date = act_time.date()
-            else:
-                act_date = datetime.strptime(str(act_time), "%Y-%m-%dT%H:%M:%S.%fZ").date()
-            if act_date == today:
-                pnl += float(getattr(a, "amount", 0))
-        daily_loss_total = -pnl if pnl < 0 else 0
-        return daily_loss_total
-    except Exception as e:
-        log(f"Failed to calculate daily PnL: {e}")
-        return daily_loss_total
-
-def is_within_trading_hours():
-    now = datetime.now(TZ).time()
-    start = datetime.strptime(TRADING_START, "%H:%M").time()
-    end = datetime.strptime(TRADING_END, "%H:%M").time()
-    return start <= now <= end
-
-# ================= DATA =================
-def fetch(symbol):
-    df = yf.download(
-        symbol,
-        period="1d",
-        interval="1m",
-        progress=False,
-        auto_adjust=True
-    )
-    if df is None or df.empty:
-        return None
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0].lower() for c in df.columns]
-    else:
-        df.columns = [str(c).lower() for c in df.columns]
-    required = {"open", "high", "low", "close", "volume"}
-    if not required.issubset(df.columns):
-        return None
-    return df.dropna().tail(LOOKBACK_MIN + 1)
-
-# ================= SIGNAL =================
-def get_signal(symbol):
-    df = fetch(symbol)
-    if df is None or len(df) < LOOKBACK_MIN:
-        return None
-    recent = df.tail(LOOKBACK_MIN)
-    start = float(recent["close"].iloc[0])
-    end = float(recent["close"].iloc[-1])
-    move = (end - start) / start
-    volume = int(recent["volume"].iloc[-1])
-    if abs(move) < MIN_MOVE_PCT or volume < MIN_VOLUME:
-        return None
-    return {
-        "symbol": symbol,
-        "price": end,
-        "score": abs(move),
-        "direction": "long" if move > 0 else "short"
-    }
-
-# ================= ORDER =================
-def calc_qty(price):
-    eq = equity()
-    bp = buying_power()
-    if eq <= 0 or bp <= 0:
-        return 0
-    risk_dollars = eq * RISK_PER_TRADE
-    per_share_risk = price * SL_PCT
-    qty_risk = math.floor(risk_dollars / per_share_risk)
-    max_position_value = eq * MAX_POSITION_PCT
-    qty_cap = math.floor(max_position_value / price)
-    qty = min(qty_risk, qty_cap)
-    return max(1, qty)
-
-def round_price(p):
-    return round(p, 2)
-
-def submit_trade(symbol, price, direction):
-    global last_trade_time, daily_trades_count
-
-    # Check cooldown
-    now = datetime.now(TZ)
-    if symbol in last_trade_time and (now - last_trade_time[symbol]).total_seconds() < SYMBOL_COOLDOWN_MIN * 60:
-        log(f"Cooldown active for {symbol}")
-        return False
-
-    # Check daily trade limit
-    if daily_trades_count >= MAX_TRADES_PER_DAY:
-        log("Reached max daily trades")
-        return False
-
-    # Check daily loss lock
-    if daily_pnl() <= -MAX_DAILY_LOSS:
-        log(f"Daily loss limit reached: {daily_loss_total}")
-        return False
-
-    qty = calc_qty(price)
-    if qty <= 0:
-        log(f"Skip {symbol}: qty=0")
-        return False
-
-    tp_price = round_price(price * (1 + TP_PCT)) if direction == "long" else round_price(price * (1 - TP_PCT))
-    sl_price = round_price(price * (1 - SL_PCT)) if direction == "long" else round_price(price * (1 + SL_PCT))
-
-    try:
-        api.submit_order(
-            symbol=symbol,
-            qty=qty,
-            side="buy" if direction == "long" else "sell_short",
-            type="market",
-            time_in_force="day",
-            order_class="bracket",
-            take_profit={"limit_price": str(tp_price)},
-            stop_loss={"stop_price": str(sl_price)}
-        )
-        log(f"ENTER {symbol} qty={qty} dir={direction} tp={tp_price} sl={sl_price}")
-        last_trade_time[symbol] = now
-        daily_trades_count += 1
+def daily_loss_exceeded():
+    global starting_equity
+    equity = get_equity()
+    loss_pct = (starting_equity - equity) / starting_equity
+    if loss_pct >= MAX_DAILY_LOSS_PCT:
+        log.error(f"DAILY LOSS LIMIT HIT: {loss_pct:.2%}")
         return True
-    except Exception as e:
-        log(f"ORDER ERROR {symbol}: {e}")
-        return False
+    return False
 
-# ================= MAIN =================
-def main():
-    log("Cron run start")
-    if not market_open() or not is_within_trading_hours():
-        log("Market closed or outside trading window")
-        return
+def get_recent_move(symbol):
+    bars = api.get_bars(
+        symbol,
+        timeframe="1Min",
+        limit=LOOKBACK_MINUTES + 1
+    )
 
-    signals = []
-    for sym in SYMBOLS:
+    if len(bars) < 2:
+        return None
+
+    old = bars[0].c
+    new = bars[-1].c
+    return (new - old) / old
+
+def flatten(symbol):
+    try:
+        api.close_position(symbol)
+        log.info(f"FLATTENED {symbol}")
+    except Exception:
+        pass
+
+# =========================
+# MAIN LOOP
+# =========================
+
+def run():
+    global trade_count, starting_equity
+
+    starting_equity = get_equity()
+    log.info(f"STARTING EQUITY: {starting_equity}")
+
+    while True:
         try:
-            sig = get_signal(sym)
-            if sig:
-                signals.append(sig)
+            if not market_open():
+                log.info("Market closed — sleeping")
+                time.sleep(60)
+                continue
+
+            if trade_count >= MAX_TRADES_PER_DAY:
+                log.warning("Max trades reached for day")
+                break
+
+            if daily_loss_exceeded():
+                break
+
+            for symbol in SYMBOLS:
+                move = get_recent_move(symbol)
+
+                if move is None:
+                    log.info(f"{symbol}: not enough data")
+                    continue
+
+                log.info(f"{symbol}: move {move:.4%}")
+
+                if abs(move) < MIN_MOVE_PCT:
+                    log.info(f"{symbol}: move too small — skip")
+                    continue
+
+                side = "buy" if move > 0 else "sell"
+
+                try:
+                    api.submit_order(
+                        symbol=symbol,
+                        notional=NOTIONAL_PER_TRADE,
+                        side=side,
+                        type="market",
+                        time_in_force="day",
+                    )
+                    trade_count += 1
+                    log.info(f"ORDER SENT {symbol} {side.upper()}")
+
+                    time.sleep(2)
+
+                    position = api.get_position(symbol)
+                    entry_price = float(position.avg_entry_price)
+
+                    if side == "buy":
+                        stop = entry_price * (1 - STOP_LOSS_PCT)
+                        target = entry_price * (1 + TAKE_PROFIT_PCT)
+                    else:
+                        stop = entry_price * (1 + STOP_LOSS_PCT)
+                        target = entry_price * (1 - TAKE_PROFIT_PCT)
+
+                    # simple manual exit loop
+                    while True:
+                        last = api.get_last_trade(symbol).price
+
+                        if side == "buy" and (last <= stop or last >= target):
+                            flatten(symbol)
+                            break
+
+                        if side == "sell" and (last >= stop or last <= target):
+                            flatten(symbol)
+                            break
+
+                        time.sleep(3)
+
+                except Exception as e:
+                    log.error(f"{symbol}: ORDER FAILED — {e}")
+
+            time.sleep(SLEEP_SECONDS)
+
+        except KeyboardInterrupt:
+            log.warning("MANUAL STOP")
+            break
+
         except Exception as e:
-            log(f"{sym} error: {e}")
+            log.error(f"FATAL LOOP ERROR: {e}")
+            time.sleep(30)
 
-    if not signals:
-        log("No signals")
-        return
+    log.info("BOT STOPPED")
 
-    # Sort by strongest momentum first
-    signals.sort(key=lambda x: x["score"], reverse=True)
-
-    for sig in signals:
-        if submit_trade(sig["symbol"], sig["price"], sig["direction"]):
-            break  # Only one trade per cron run
+# =========================
+# RUN
+# =========================
 
 if __name__ == "__main__":
-    main()
+    run()
