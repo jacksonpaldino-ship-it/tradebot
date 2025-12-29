@@ -58,9 +58,22 @@ def submit_bracket(symbol, side, qty, price):
     if side == "buy":
         tp = round(price * (1 + TAKE_PROFIT_PCT), 2)
         sl = round(price * (1 - STOP_LOSS_PCT), 2)
-    else:
+
+        # Enforce minimum distance
+        if tp <= price:
+            tp = round(price + 0.01, 2)
+        if sl >= price:
+            sl = round(price - 0.01, 2)
+
+    else:  # SHORT
         tp = round(price * (1 - TAKE_PROFIT_PCT), 2)
         sl = round(price * (1 + STOP_LOSS_PCT), 2)
+
+        # Enforce Alpaca short rules
+        if tp >= price - 0.01:
+            tp = round(price - 0.01, 2)
+        if sl <= price + 0.01:
+            sl = round(price + 0.01, 2)
 
     api.submit_order(
         symbol=symbol,
