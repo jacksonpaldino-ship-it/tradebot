@@ -1,222 +1,230 @@
+#!/usr/bin/env python3
+
 import os
+import math
 import time
 import logging
 from datetime import datetime, timedelta
 import pytz
 
-from alpaca_trade_api import REST
-from alpaca_trade_api.rest import TimeFrame
+import pandas as pd
+import yfinance as yf
+from alpaca_trade_api.rest import REST, TimeFrame
 
 # ================= CONFIG =================
 
 SYMBOLS = ["XLE", "XLF", "XLV", "XLY", "IWM"]
 
-RISK_PER_TRADE = 0.005          # 0.5% equity
-STOP_R = 1.0
-TARGET_R = 2.0
-TRAIL_AFTER_R = 1.0
+LOOKBACK_MIN = 5
+MIN_MOVE_PCT = 0.001        # 0.10% (aggressive but sane)
+MIN_VOLUME = 500_000
 
-TIME_STOP_MINUTES = 20
-MAX_DAILY_LOSS = -0.02          # -2% equity
-COOLDOWN_MINUTES = 10
+RISK_PER_TRADE = 0.003      # 0.3% equity
+MAX_POSITION_PCT = 0.20
 
-MIN_MOVE_PCT = 0.0015           # 0.15%
-MIN_VOLUME = 50000
+TAKE_PROFIT_PCT = 0.0025    # 0.25%
+STOP_LOSS_PCT = 0.0018      # 0.18%
 
-MARKET_CLOSE_BUFFER_MIN = 10    # flatten before close
+MAX_DAILY_LOSS_PCT = 0.02   # 2% daily loss kill switch
+SYMBOL_COOLDOWN_MIN = 10    # minutes
+
+FORCE_FLAT_TIME = (15, 55)  # 3:55 PM ET
+
+TZ = pytz.timezone("US/Eastern")
 
 # ================= LOGGING =================
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-# ================= API =================
+log = logging.getLogger(__name__)
 
-api = REST(
-    os.environ["APCA_API_KEY_ID"],
-    os.environ["APCA_API_SECRET_KEY"],
-    base_url="https://paper-api.alpaca.markets"
-)
+# ================= ALPACA =================
 
-NY = pytz.timezone("America/New_York")
+API_KEY = os.environ["APCA_API_KEY_ID"]
+API_SECRET = os.environ["APCA_API_SECRET_KEY"]
+BASE_URL = os.environ["APCA_API_BASE_URL"]
+
+api = REST(API_KEY, API_SECRET, BASE_URL)
 
 # ================= STATE =================
 
-cooldowns = {}
-trade_entry_time = {}
-trade_entry_price = {}
-daily_start_equity = None
+last_trade_time = {}
+start_of_day_equity = None
 
-# ================= HELPERS =================
+# ================= UTILS =================
 
-def now():
-    return datetime.now(NY)
+def now_et():
+    return datetime.now(TZ)
 
 def market_open():
-    clock = api.get_clock()
-    return clock.is_open
+    return api.get_clock().is_open
 
-def minutes_to_close():
-    clock = api.get_clock()
-    return (clock.next_close - clock.timestamp).total_seconds() / 60
-
-def get_equity():
+def equity():
     return float(api.get_account().equity)
 
-def get_position(symbol):
-    try:
-        return api.get_position(symbol)
-    except:
-        return None
+def positions_by_symbol():
+    return {p.symbol: p for p in api.list_positions()}
+
+def daily_loss_exceeded():
+    global start_of_day_equity
+    eq = equity()
+    if start_of_day_equity is None:
+        start_of_day_equity = eq
+        return False
+    loss_pct = (start_of_day_equity - eq) / start_of_day_equity
+    return loss_pct >= MAX_DAILY_LOSS_PCT
 
 def in_cooldown(symbol):
-    if symbol not in cooldowns:
+    if symbol not in last_trade_time:
         return False
-    return now() < cooldowns[symbol]
+    return (now_et() - last_trade_time[symbol]) < timedelta(minutes=SYMBOL_COOLDOWN_MIN)
 
-# ================= DAILY KILL SWITCH =================
+# ================= DATA =================
 
-def check_daily_loss():
-    global daily_start_equity
-    if daily_start_equity is None:
-        daily_start_equity = get_equity()
-        return False
+def fetch_data(symbol):
+    df = yf.download(
+        symbol,
+        period="1d",
+        interval="1m",
+        progress=False,
+        auto_adjust=True,
+    )
 
-    pnl = (get_equity() - daily_start_equity) / daily_start_equity
-    if pnl <= MAX_DAILY_LOSS:
-        logging.error("MAX DAILY LOSS HIT — FLATTENING")
-        close_all()
-        return True
-    return False
+    if df.empty:
+        return None
 
-# ================= EXIT LOGIC =================
+    df.columns = [c.lower() for c in df.columns]
+    return df.dropna().tail(LOOKBACK_MIN + 1)
 
-def exit_conditions(symbol, position, last_price):
-    entry = trade_entry_price[symbol]
-    age = (now() - trade_entry_time[symbol]).total_seconds() / 60
+# ================= SIGNAL =================
 
-    qty = abs(float(position.qty))
-    side = position.side
+def get_signal(symbol):
+    df = fetch_data(symbol)
+    if df is None or len(df) < LOOKBACK_MIN:
+        return None
 
-    risk = entry * STOP_R * MIN_MOVE_PCT
-    reward = entry * TARGET_R * MIN_MOVE_PCT
+    start = df["close"].iloc[0]
+    end = df["close"].iloc[-1]
+    move = (end - start) / start
 
-    # Directional math
-    pnl = (last_price - entry) if side == "long" else (entry - last_price)
+    vol = df["volume"].iloc[-1]
 
-    # STOP LOSS
-    if pnl <= -risk:
-        return "STOP"
+    log.info(f"{symbol}: move {move*100:.4f}%")
 
-    # PROFIT TARGET
-    if pnl >= reward:
-        return "TARGET"
+    if abs(move) < MIN_MOVE_PCT:
+        log.info(f"{symbol}: move too small — skip")
+        return None
 
-    # TIME STOP
-    if age >= TIME_STOP_MINUTES and pnl < reward * 0.25:
-        return "TIME"
-
-    # MOMENTUM FAILURE
-    if pnl < 0 and age > 5:
-        return "FAIL"
-
-    # TRAIL STOP
-    if pnl >= risk * TRAIL_AFTER_R:
-        trail_level = entry
-        if (side == "long" and last_price <= trail_level) or \
-           (side == "short" and last_price >= trail_level):
-            return "TRAIL"
-
-    return None
-
-def close_position(symbol, reason):
-    try:
-        api.close_position(symbol)
-        cooldowns[symbol] = now() + timedelta(minutes=COOLDOWN_MINUTES)
-        trade_entry_time.pop(symbol, None)
-        trade_entry_price.pop(symbol, None)
-        logging.info(f"{symbol}: EXIT — {reason}")
-    except Exception as e:
-        logging.error(f"{symbol}: EXIT FAILED — {e}")
-
-def close_all():
-    for pos in api.list_positions():
-        close_position(pos.symbol, "FLATTEN")
-
-# ================= ENTRY LOGIC =================
-
-def try_entry(symbol):
-    if in_cooldown(symbol):
-        return
-
-    if get_position(symbol):
-        return
-
-    bars = api.get_bars(symbol, TimeFrame.Minute, limit=6).df
-    if len(bars) < 6:
-        return
-
-    move = (bars.close.iloc[-1] - bars.open.iloc[0]) / bars.open.iloc[0]
-    volume = bars.volume.sum()
-
-    if abs(move) < MIN_MOVE_PCT or volume < MIN_VOLUME:
-        return
+    if vol < MIN_VOLUME:
+        log.info(f"{symbol}: volume too low — skip")
+        return None
 
     side = "buy" if move > 0 else "sell"
-    equity = get_equity()
-    risk_dollars = equity * RISK_PER_TRADE
-    qty = int(risk_dollars / (bars.close.iloc[-1] * MIN_MOVE_PCT))
+    return {"symbol": symbol, "side": side, "price": end}
+
+# ================= SIZING =================
+
+def calc_qty(price):
+    eq = equity()
+    risk_dollars = eq * RISK_PER_TRADE
+    per_share_risk = price * STOP_LOSS_PCT
+    qty_risk = risk_dollars / per_share_risk
+
+    cap_qty = (eq * MAX_POSITION_PCT) / price
+    return max(1, int(min(qty_risk, cap_qty)))
+
+# ================= ORDERS =================
+
+def submit_trade(signal):
+    symbol = signal["symbol"]
+    side = signal["side"]
+    price = signal["price"]
+
+    qty = calc_qty(price)
     if qty <= 0:
         return
 
-    try:
-        api.submit_order(
-            symbol=symbol,
-            qty=qty,
-            side=side,
-            type="market",
-            time_in_force="day"
-        )
+    if side == "buy":
+        tp = round(price * (1 + TAKE_PROFIT_PCT), 2)
+        sl = round(price * (1 - STOP_LOSS_PCT), 2)
+    else:
+        tp = round(price * (1 - TAKE_PROFIT_PCT), 2)
+        sl = round(price * (1 + STOP_LOSS_PCT), 2)
 
-        trade_entry_time[symbol] = now()
-        trade_entry_price[symbol] = bars.close.iloc[-1]
+    api.submit_order(
+        symbol=symbol,
+        qty=qty,
+        side=side,
+        type="market",
+        time_in_force="day",
+        order_class="bracket",
+        take_profit={"limit_price": tp},
+        stop_loss={"stop_price": sl},
+    )
 
-        logging.info(f"{symbol}: ENTER {side.upper()} {qty}")
+    last_trade_time[symbol] = now_et()
+    log.info(f"ORDER SENT {symbol} {side.upper()} qty={qty}")
 
-    except Exception as e:
-        logging.error(f"{symbol}: ENTRY FAILED — {e}")
+# ================= EXITS =================
+
+def manage_positions():
+    positions = positions_by_symbol()
+
+    for sym, pos in positions.items():
+        entry = float(pos.avg_entry_price)
+        current = float(pos.current_price)
+        side = pos.side
+
+        if side == "long":
+            pnl_pct = (current - entry) / entry
+        else:
+            pnl_pct = (entry - current) / entry
+
+        if pnl_pct <= -STOP_LOSS_PCT:
+            log.info(f"{sym}: STOP LOSS EXIT")
+            api.close_position(sym)
 
 # ================= MAIN =================
 
 def main():
-    logging.info("BOT START")
+    log.info("BOT START")
 
     if not market_open():
-        logging.info("Market closed")
+        log.info("Market closed")
         return
 
-    if check_daily_loss():
+    if daily_loss_exceeded():
+        log.error("DAILY LOSS LIMIT HIT — FLATTENING")
+        api.close_all_positions()
         return
 
-    if minutes_to_close() <= MARKET_CLOSE_BUFFER_MIN:
-        logging.info("Flattening before close")
-        close_all()
-        return
+    positions = positions_by_symbol()
 
-    # Manage open positions
-    for pos in api.list_positions():
-        last = api.get_latest_trade(pos.symbol).price
-        reason = exit_conditions(pos.symbol, pos, last)
-        if reason:
-            close_position(pos.symbol, reason)
-
-    # Look for new entries
     for symbol in SYMBOLS:
-        try_entry(symbol)
+        if symbol in positions:
+            log.info(f"{symbol}: already in position — skip")
+            continue
 
-    logging.info("BOT END")
+        if in_cooldown(symbol):
+            log.info(f"{symbol}: cooldown — skip")
+            continue
+
+        signal = get_signal(symbol)
+        if signal:
+            submit_trade(signal)
+
+    manage_positions()
+
+    # FORCE FLAT BEFORE CLOSE
+    now = now_et()
+    if (now.hour, now.minute) >= FORCE_FLAT_TIME:
+        log.info("FORCE FLAT — END OF DAY")
+        api.close_all_positions()
+
+    log.info("BOT END")
 
 if __name__ == "__main__":
     main()
