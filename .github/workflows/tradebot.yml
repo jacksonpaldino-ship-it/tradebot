@@ -2,31 +2,31 @@ name: TradeBot
 
 on:
   schedule:
-    # Every 10 minutes from 09:30 to 15:30 ET, Monday to Friday
-    - cron: "*/10 14-20 * * 1-5"  # GitHub Actions runs in UTC; ET = UTC-5
+    - cron: "*/5 13-20 * * 1-5"
   workflow_dispatch:
 
 jobs:
-  run-bot:
+  trade:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install alpaca-trade-api pandas pytz
 
-      - name: Run TradeBot
+      - name: Run tradebot
         env:
-          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          LPACA_API_KEY: ${{ secrets.LPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
         run: |
           echo "Start $(TZ='America/New_York' date)"
-          python hybrid_tradebot_v13_1.py
+          python hybrid_tradebot.py
