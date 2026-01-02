@@ -10,9 +10,9 @@ from alpaca_trade_api import REST
 
 SYMBOLS = ["XLE", "XLF", "XLV", "XLY", "IWM"]
 
-MAX_RISK_PER_TRADE = 0.005     # 0.5% equity
-MAX_BP_UTIL = 0.25             # 25% buying power per trade
-MAX_DAILY_LOSS = -0.02         # -2% kill switch
+MAX_RISK_PER_TRADE = 0.005      # 0.5% equity
+MAX_BP_UTIL = 0.20              # 20% buying power cap
+MAX_DAILY_LOSS = -0.02          # -2% daily kill switch
 COOLDOWN_MINUTES = 15
 
 EMA_FAST = 9
@@ -22,7 +22,7 @@ ATR_PERIOD = 14
 ATR_STOP_MULT = 1.0
 ATR_TP_MULT = 1.5
 
-RUN_MINUTES = 10               # GitHub Action runtime
+RUN_MINUTES = 6                 # GitHub Action runtime
 SLEEP_SECONDS = 60
 
 # =========================================
@@ -61,7 +61,15 @@ def trade_window():
          t <= datetime.strptime("15:45", "%H:%M").time())
     )
 
+def get_bars(symbol):
+    df = api.get_bars(symbol, "1Min", limit=100).df
+    if df is None or df.empty:
+        return None
+    return df
+
 def indicators(df):
+    df = df.copy()
+
     df["ema_fast"] = df["close"].ewm(span=EMA_FAST).mean()
     df["ema_slow"] = df["close"].ewm(span=EMA_SLOW).mean()
 
@@ -73,10 +81,6 @@ def indicators(df):
 
     df["atr"] = tr.rolling(ATR_PERIOD).mean()
     return df
-
-def get_bars(symbol):
-    df = api.get_bars(symbol, "1Min", limit=100).df
-    return df[df["symbol"] == symbol]
 
 def in_position(symbol):
     try:
@@ -92,13 +96,16 @@ def cooldown_active(symbol):
 
 def place_trade(symbol, side, atr):
     account = api.get_account()
-
     equity = float(account.equity)
     buying_power = float(account.buying_power)
+
     price = float(api.get_last_trade(symbol).price)
 
     risk_dollars = equity * MAX_RISK_PER_TRADE
     stop_dist = atr * ATR_STOP_MULT
+
+    if stop_dist <= 0:
+        return
 
     qty_risk = int(risk_dollars / stop_dist)
     qty_bp = int((buying_power * MAX_BP_UTIL) / price)
@@ -106,7 +113,6 @@ def place_trade(symbol, side, atr):
     qty = min(qty_risk, qty_bp)
 
     if qty < 1:
-        logging.info(f"{symbol} SKIP — qty too small")
         return
 
     logging.info(f"{symbol} | {side.upper()} | qty={qty}")
@@ -131,8 +137,12 @@ def manage_exits():
         qty = abs(int(float(p.qty)))
         entry = float(p.avg_entry_price)
         current = float(p.current_price)
-        atr = float(indicators(get_bars(symbol)).iloc[-1]["atr"])
 
+        df = get_bars(symbol)
+        if df is None:
+            continue
+
+        atr = indicators(df).iloc[-1]["atr"]
         if atr <= 0:
             continue
 
@@ -145,6 +155,7 @@ def manage_exits():
            (p.side == "short" and (current >= stop or current <= tp)):
 
             logging.info(f"{symbol} EXIT @ {current}")
+
             api.submit_order(
                 symbol=symbol,
                 qty=qty,
@@ -174,7 +185,11 @@ def run_cycle():
         if in_position(symbol) or cooldown_active(symbol):
             continue
 
-        df = indicators(get_bars(symbol))
+        df = get_bars(symbol)
+        if df is None or len(df) < 20:
+            continue
+
+        df = indicators(df)
         last = df.iloc[-1]
         prev = df.iloc[-2]
 
