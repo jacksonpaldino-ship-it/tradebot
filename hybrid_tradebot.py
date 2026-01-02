@@ -10,9 +10,9 @@ from alpaca_trade_api import REST
 
 SYMBOLS = ["XLE", "XLF", "XLV", "XLY", "IWM"]
 
-MAX_RISK_PER_TRADE = 0.005      # 0.5% equity
-MAX_BP_UTIL = 0.20              # 20% buying power cap
-MAX_DAILY_LOSS = -0.02          # -2% daily kill switch
+MAX_RISK_PER_TRADE = 0.005
+MAX_BP_UTIL = 0.20
+MAX_DAILY_LOSS = -0.02
 COOLDOWN_MINUTES = 15
 
 EMA_FAST = 9
@@ -22,7 +22,7 @@ ATR_PERIOD = 14
 ATR_STOP_MULT = 1.0
 ATR_TP_MULT = 1.5
 
-RUN_MINUTES = 6                 # GitHub Action runtime
+RUN_MINUTES = 6
 SLEEP_SECONDS = 60
 
 # =========================================
@@ -99,7 +99,8 @@ def place_trade(symbol, side, atr):
     equity = float(account.equity)
     buying_power = float(account.buying_power)
 
-    price = float(api.get_last_trade(symbol).price)
+    # ✅ FIXED METHOD NAME
+    price = float(api.get_latest_trade(symbol).price)
 
     risk_dollars = equity * MAX_RISK_PER_TRADE
     stop_dist = atr * ATR_STOP_MULT
@@ -130,9 +131,7 @@ def place_trade(symbol, side, atr):
 # =========================================
 
 def manage_exits():
-    positions = api.list_positions()
-
-    for p in positions:
+    for p in api.list_positions():
         symbol = p.symbol
         qty = abs(int(float(p.qty)))
         entry = float(p.avg_entry_price)
