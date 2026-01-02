@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timedelta
 import pytz
 import pandas as pd
-from alpaca_trade_api import REST, APIError
+from alpaca_trade_api import REST, tradeapi
 
 # ================= CONFIG =================
 SYMBOLS = ["XLE", "XLF", "XLV", "XLY", "IWM"]
@@ -81,7 +81,7 @@ def position_exists(symbol):
     try:
         api.get_position(symbol)
         return True
-    except:
+    except tradeapi.rest.APIError:
         return False
 
 def cooldown_active(symbol):
@@ -98,7 +98,6 @@ def place_trade(symbol, side, price, atr, equity):
         if side == "buy":
             stop = round(price - stop_distance, 2)
             tp = round(price + atr * ATR_TP_MULT, 2)
-            # Ensure valid bracket prices
             if tp <= price:
                 tp = round(price + 0.01, 2)
             if stop >= price:
@@ -126,7 +125,7 @@ def place_trade(symbol, side, price, atr, equity):
 
         cooldowns[symbol] = now_et() + timedelta(minutes=COOLDOWN_MINUTES)
 
-    except APIError as e:
+    except tradeapi.rest.APIError as e:
         logging.error(f"{symbol} ORDER FAILED — {e}")
 
 # ================= CORE CYCLE =================
