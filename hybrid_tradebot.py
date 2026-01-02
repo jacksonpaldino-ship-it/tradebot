@@ -1,36 +1,31 @@
 import os
-import time
 import logging
-from datetime import datetime, timedelta
-import pytz
+from datetime import datetime
+
 import pandas as pd
+import numpy as np
 from alpaca_trade_api import REST
 
 # ================= CONFIG =================
 
 SYMBOLS = ["XLE", "XLF", "XLV", "XLY", "IWM"]
+TIMEFRAME = "5Min"
+LOOKBACK = 50
 
-MAX_RISK_PER_TRADE = 0.005
-MAX_BP_UTIL = 0.20
-MAX_DAILY_LOSS = -0.02
-COOLDOWN_MINUTES = 15
+RISK_PER_TRADE = 0.0025      # 0.25%
+STOP_ATR_MULT = 1.2
+MAX_POSITION_PCT = 0.15      # 15% per symbol
+MAX_TOTAL_EXPOSURE = 0.5     # 50% total
+MIN_ATR = 0.1
 
-EMA_FAST = 9
-EMA_SLOW = 21
-ATR_PERIOD = 14
-
-ATR_STOP_MULT = 1.0
-ATR_TP_MULT = 1.5
-
-RUN_MINUTES = 6
-SLEEP_SECONDS = 60
-
-# =========================================
+# ================= LOGGING =================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
+
+# ================= API =================
 
 API_KEY = os.getenv("ALPACA_API_KEY")
 API_SECRET = os.getenv("ALPACA_SECRET_KEY")
@@ -39,178 +34,117 @@ BASE_URL = os.getenv("ALPACA_BASE_URL")
 if not API_KEY or not API_SECRET or not BASE_URL:
     raise RuntimeError("Missing Alpaca environment variables")
 
-api = REST(API_KEY, API_SECRET, BASE_URL)
+api = REST(API_KEY, API_SECRET, BASE_URL, api_version="v2")
 
-eastern = pytz.timezone("America/New_York")
-cooldowns = {}
+# ================= INDICATORS =================
 
-# =========================================
-
-def now_et():
-    return datetime.now(eastern)
-
-def market_open():
-    return api.get_clock().is_open
-
-def trade_window():
-    t = now_et().time()
-    return (
-        (t >= datetime.strptime("09:35", "%H:%M").time() and
-         t <= datetime.strptime("11:30", "%H:%M").time()) or
-        (t >= datetime.strptime("13:30", "%H:%M").time() and
-         t <= datetime.strptime("15:45", "%H:%M").time())
-    )
-
-def get_bars(symbol):
-    df = api.get_bars(symbol, "1Min", limit=100).df
-    if df is None or df.empty:
-        return None
-    return df
-
-def indicators(df):
-    df = df.copy()
-
-    df["ema_fast"] = df["close"].ewm(span=EMA_FAST).mean()
-    df["ema_slow"] = df["close"].ewm(span=EMA_SLOW).mean()
+def compute_atr(df, period=14):
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
 
     tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - df["close"].shift()).abs(),
-        (df["low"] - df["close"].shift()).abs()
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
     ], axis=1).max(axis=1)
 
-    df["atr"] = tr.rolling(ATR_PERIOD).mean()
-    return df
+    return tr.rolling(period).mean()
 
-def in_position(symbol):
-    try:
-        api.get_position(symbol)
-        return True
-    except:
-        return False
+# ================= DATA =================
 
-def cooldown_active(symbol):
-    return symbol in cooldowns and now_et() < cooldowns[symbol]
+def get_bars(symbol):
+    bars = api.get_bars(
+        symbol,
+        TIMEFRAME,
+        limit=LOOKBACK
+    ).df
 
-# =========================================
+    if bars.empty:
+        return None
+
+    return bars
+
+# ================= RISK =================
+
+def total_exposure():
+    positions = api.list_positions()
+    return sum(abs(float(p.market_value)) for p in positions)
+
+# ================= TRADING =================
 
 def place_trade(symbol, side, atr):
+    if atr is None or atr < MIN_ATR:
+        return
+
     account = api.get_account()
     equity = float(account.equity)
-    buying_power = float(account.buying_power)
-
-    # ✅ FIXED METHOD NAME
     price = float(api.get_latest_trade(symbol).price)
 
-    risk_dollars = equity * MAX_RISK_PER_TRADE
-    stop_dist = atr * ATR_STOP_MULT
+    risk_dollars = equity * RISK_PER_TRADE
+    stop_distance = atr * STOP_ATR_MULT
 
-    if stop_dist <= 0:
+    qty = int(risk_dollars / stop_distance)
+    if qty <= 0:
         return
 
-    qty_risk = int(risk_dollars / stop_dist)
-    qty_bp = int((buying_power * MAX_BP_UTIL) / price)
+    # Cap per-symbol exposure
+    max_qty = int((equity * MAX_POSITION_PCT) / price)
+    qty = min(qty, max_qty)
 
-    qty = min(qty_risk, qty_bp)
-
-    if qty < 1:
+    if qty <= 0:
         return
 
-    logging.info(f"{symbol} | {side.upper()} | qty={qty}")
+    # Portfolio exposure check
+    if total_exposure() + qty * price > equity * MAX_TOTAL_EXPOSURE:
+        logging.info(f"{symbol} | exposure cap hit — skip")
+        return
 
-    api.submit_order(
-        symbol=symbol,
-        qty=qty,
-        side=side,
-        type="market",
-        time_in_force="day"
-    )
+    try:
+        api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side=side,
+            type="market",
+            time_in_force="day"
+        )
+        logging.info(f"{symbol} | {side.upper()} | qty={qty}")
 
-    cooldowns[symbol] = now_et() + timedelta(minutes=COOLDOWN_MINUTES)
+    except Exception as e:
+        logging.error(f"{symbol} ORDER FAILED — {e}")
 
-# =========================================
-
-def manage_exits():
-    for p in api.list_positions():
-        symbol = p.symbol
-        qty = abs(int(float(p.qty)))
-        entry = float(p.avg_entry_price)
-        current = float(p.current_price)
-
-        df = get_bars(symbol)
-        if df is None:
-            continue
-
-        atr = indicators(df).iloc[-1]["atr"]
-        if atr <= 0:
-            continue
-
-        stop = entry - atr * ATR_STOP_MULT if p.side == "long" else entry + atr * ATR_STOP_MULT
-        tp = entry + atr * ATR_TP_MULT if p.side == "long" else entry - atr * ATR_TP_MULT
-
-        exit_side = "sell" if p.side == "long" else "buy"
-
-        if (p.side == "long" and (current <= stop or current >= tp)) or \
-           (p.side == "short" and (current >= stop or current <= tp)):
-
-            logging.info(f"{symbol} EXIT @ {current}")
-
-            api.submit_order(
-                symbol=symbol,
-                qty=qty,
-                side=exit_side,
-                type="market",
-                time_in_force="day"
-            )
-
-# =========================================
+# ================= STRATEGY =================
 
 def run_cycle():
-    if not market_open() or not trade_window():
-        return
+    logging.info("BOT START")
 
     account = api.get_account()
-    daily_pnl = float(account.equity) / float(account.last_equity) - 1
+    equity = float(account.equity)
+    pnl = float(account.equity) / float(account.last_equity) - 1 if account.last_equity else 0
 
-    logging.info(f"Equity: {account.equity} | Daily PnL: {daily_pnl:.2%}")
-
-    if daily_pnl <= MAX_DAILY_LOSS:
-        logging.warning("DAILY LOSS LIMIT HIT — STOPPING")
-        return
-
-    manage_exits()
+    logging.info(f"Equity: {equity:.2f} | Daily PnL: {pnl:.2%}")
 
     for symbol in SYMBOLS:
-        if in_position(symbol) or cooldown_active(symbol):
-            continue
+        try:
+            df = get_bars(symbol)
+            if df is None or len(df) < 20:
+                continue
 
-        df = get_bars(symbol)
-        if df is None or len(df) < 20:
-            continue
+            df["atr"] = compute_atr(df)
+            last = df.iloc[-1]
 
-        df = indicators(df)
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
+            # Simple momentum filter (non-stupid)
+            if last["close"] > df["close"].rolling(20).mean().iloc[-1]:
+                place_trade(symbol, "buy", last["atr"])
+            else:
+                place_trade(symbol, "sell", last["atr"])
 
-        if last["atr"] <= 0:
-            continue
-
-        momentum = abs(last["close"] - prev["close"]) > last["atr"] * 0.3
-
-        if last["ema_fast"] > last["ema_slow"] and momentum:
-            place_trade(symbol, "buy", last["atr"])
-
-        elif last["ema_fast"] < last["ema_slow"] and momentum:
-            place_trade(symbol, "sell", last["atr"])
-
-# =========================================
-
-if __name__ == "__main__":
-    logging.info("BOT START")
-    start = time.time()
-
-    while time.time() - start < RUN_MINUTES * 60:
-        run_cycle()
-        time.sleep(SLEEP_SECONDS)
+        except Exception as e:
+            logging.error(f"{symbol} ERROR — {e}")
 
     logging.info("BOT END")
+
+# ================= RUN =================
+
+if __name__ == "__main__":
+    run_cycle()
