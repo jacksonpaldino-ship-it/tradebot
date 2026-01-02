@@ -10,8 +10,8 @@ from alpaca_trade_api import REST
 
 SYMBOLS = ["XLE", "XLF", "XLV", "XLY", "IWM"]
 
-MAX_RISK_PER_TRADE = 0.01      # 1% equity
-MAX_DAILY_LOSS = -0.02         # -2% kill switch
+MAX_RISK_PER_TRADE = 0.01
+MAX_DAILY_LOSS = -0.02
 COOLDOWN_MINUTES = 10
 
 LOOP_MINUTES = 15
@@ -21,11 +21,9 @@ EMA_FAST = 9
 EMA_SLOW = 21
 ATR_PERIOD = 14
 
-ATR_ENTRY_MULT = 0.25
+ATR_ENTRY_MULT = 0.2
 ATR_STOP_MULT = 0.5
-ATR_TP_MULT = 0.75
-
-MIN_TICK = 0.01
+ATR_TP_MULT = 0.8
 
 # ==========================================
 
@@ -34,13 +32,22 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-# ✅ CORRECT ENV VARS
+# ===== ENV VARS =====
 API_KEY = os.getenv("ALPACA_API_KEY")
 API_SECRET = os.getenv("ALPACA_SECRET_KEY")
 BASE_URL = os.getenv("ALPACA_BASE_URL")
 
-if not API_KEY or not API_SECRET or not BASE_URL:
-    raise RuntimeError("Missing Alpaca environment variables")
+missing = []
+if not API_KEY:
+    missing.append("ALPACA_API_KEY")
+if not API_SECRET:
+    missing.append("ALPACA_SECRET_KEY")
+if not BASE_URL:
+    missing.append("ALPACA_BASE_URL")
+
+if missing:
+    logging.error(f"Missing environment variables: {missing}")
+    raise RuntimeError("Alpaca credentials not loaded")
 
 api = REST(API_KEY, API_SECRET, BASE_URL)
 
@@ -58,9 +65,10 @@ def market_open():
 def in_trade_window():
     t = now_et().time()
     return (
-        datetime.strptime("09:35", "%H:%M").time() <= t <= datetime.strptime("11:00", "%H:%M").time()
-        or
-        datetime.strptime("13:30", "%H:%M").time() <= t <= datetime.strptime("15:45", "%H:%M").time()
+        (t >= datetime.strptime("09:35", "%H:%M").time() and
+         t <= datetime.strptime("11:30", "%H:%M").time()) or
+        (t >= datetime.strptime("13:30", "%H:%M").time() and
+         t <= datetime.strptime("15:55", "%H:%M").time())
     )
 
 def get_equity():
@@ -71,13 +79,12 @@ def get_daily_pnl():
     return float(acct.equity) / float(acct.last_equity) - 1
 
 def get_bars(symbol):
-    df = api.get_bars(symbol, "1Min", limit=100).df
+    df = api.get_bars(symbol, "1Min", limit=120).df
     return df[df["symbol"] == symbol]
 
 def indicators(df):
     df["ema_fast"] = df["close"].ewm(span=EMA_FAST).mean()
     df["ema_slow"] = df["close"].ewm(span=EMA_SLOW).mean()
-    df["vwap"] = (df["volume"] * (df["high"] + df["low"] + df["close"]) / 3).cumsum() / df["volume"].cumsum()
 
     tr = pd.concat([
         df["high"] - df["low"],
@@ -99,24 +106,21 @@ def cooldown_active(symbol):
     return symbol in cooldowns and now_et() < cooldowns[symbol]
 
 def place_trade(symbol, side, price, atr, equity):
-    if pd.isna(atr) or atr <= 0:
-        return
-
-    risk_dollars = equity * MAX_RISK_PER_TRADE
-    stop_distance = atr * ATR_STOP_MULT
-    qty = int(risk_dollars / stop_distance)
+    risk = equity * MAX_RISK_PER_TRADE
+    stop_dist = atr * ATR_STOP_MULT
+    qty = int(risk / stop_dist)
 
     if qty <= 0:
         return
 
     if side == "buy":
-        stop = round(price - stop_distance, 2)
+        stop = round(price - stop_dist, 2)
         tp = round(price + atr * ATR_TP_MULT, 2)
     else:
-        stop = round(price + stop_distance, 2)
-        tp = round(price - atr * ATR_TP_MULT - MIN_TICK, 2)
+        stop = round(price + stop_dist, 2)
+        tp = round(price - atr * ATR_TP_MULT, 2)
 
-    logging.info(f"{symbol} | {side.upper()} | qty={qty} entry={price:.2f} stop={stop} tp={tp}")
+    logging.info(f"{symbol} {side.upper()} qty={qty} entry={price} stop={stop} tp={tp}")
 
     api.submit_order(
         symbol=symbol,
@@ -143,7 +147,7 @@ def run_cycle():
     logging.info(f"Equity: {equity:.2f} | Daily PnL: {daily_pnl:.2%}")
 
     if daily_pnl <= MAX_DAILY_LOSS:
-        logging.warning("DAILY LOSS LIMIT HIT — HALTING TRADES")
+        logging.warning("DAILY LOSS LIMIT HIT — HALTING")
         return
 
     for symbol in SYMBOLS:
@@ -152,25 +156,22 @@ def run_cycle():
                 continue
 
             df = indicators(get_bars(symbol))
-            if len(df) < ATR_PERIOD + 1:
-                continue
-
             last = df.iloc[-1]
             prev = df.iloc[-2]
 
-            price = last["close"]
             atr = last["atr"]
-
-            momentum = abs(price - prev["close"]) > atr * ATR_ENTRY_MULT
-
-            if not momentum:
+            if atr <= 0:
                 continue
 
-            if last["ema_fast"] > last["ema_slow"] and price > last["vwap"]:
-                place_trade(symbol, "buy", price, atr, equity)
+            move = abs(last["close"] - prev["close"])
+            if move < atr * ATR_ENTRY_MULT:
+                continue
 
-            elif last["ema_fast"] < last["ema_slow"] and price < last["vwap"]:
-                place_trade(symbol, "sell", price, atr, equity)
+            if last["ema_fast"] > last["ema_slow"]:
+                place_trade(symbol, "buy", last["close"], atr, equity)
+
+            elif last["ema_fast"] < last["ema_slow"]:
+                place_trade(symbol, "sell", last["close"], atr, equity)
 
         except Exception as e:
             logging.error(f"{symbol} ERROR — {e}")
