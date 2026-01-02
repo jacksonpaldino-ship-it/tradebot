@@ -1,18 +1,15 @@
 import os
-import time
 import logging
 from datetime import datetime, timedelta
 import pytz
 import pandas as pd
-from alpaca_trade_api import REST
+from alpaca_trade_api import REST, APIError
 
 # ================= CONFIG =================
 SYMBOLS = ["XLE", "XLF", "XLV", "XLY", "IWM"]
-MAX_RISK_PER_TRADE = 0.01
-MAX_DAILY_LOSS = -0.02
+MAX_RISK_PER_TRADE = 0.01      # 1% equity
+MAX_DAILY_LOSS = -0.02         # -2% daily kill switch
 COOLDOWN_MINUTES = 10
-LOOP_MINUTES = 15
-SLEEP_SECONDS = 60
 
 EMA_FAST = 9
 EMA_SLOW = 21
@@ -21,6 +18,7 @@ ATR_PERIOD = 14
 ATR_ENTRY_MULT = 0.25
 ATR_STOP_MULT = 0.5
 ATR_TP_MULT = 0.75
+
 # ==========================================
 
 logging.basicConfig(
@@ -28,6 +26,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
+# ================= ENV VARS =================
 API_KEY = os.getenv("ALPACA_API_KEY")
 API_SECRET = os.getenv("ALPACA_SECRET_KEY")
 BASE_URL = os.getenv("ALPACA_BASE_URL")
@@ -39,34 +38,32 @@ api = REST(API_KEY, API_SECRET, BASE_URL)
 eastern = pytz.timezone("America/New_York")
 cooldowns = {}
 
+# ================= FUNCTIONS =================
 def now_et():
     return datetime.now(eastern)
 
 def market_open():
-    return api.get_clock().is_open
+    clock = api.get_clock()
+    return clock.is_open
 
 def in_trade_window():
     t = now_et().time()
-    return ((t >= datetime.strptime("09:35", "%H:%M").time() and
-             t <= datetime.strptime("11:00", "%H:%M").time()) or
-            (t >= datetime.strptime("13:30", "%H:%M").time() and
-             t <= datetime.strptime("15:45", "%H:%M").time()))
+    return (
+        (t >= datetime.strptime("09:35", "%H:%M").time() and t <= datetime.strptime("11:00", "%H:%M").time()) or
+        (t >= datetime.strptime("13:30", "%H:%M").time() and t <= datetime.strptime("15:45", "%H:%M").time())
+    )
 
 def get_equity():
     return float(api.get_account().equity)
 
 def get_daily_pnl():
     acct = api.get_account()
-    return float(acct.equity)/float(acct.last_equity) - 1
+    return float(acct.equity) / float(acct.last_equity) - 1
 
 def get_bars(symbol):
     bars = api.get_bars(symbol, "1Min", limit=100).df
-    if bars.empty:
-        return None
-    if 'symbol' in bars.columns:
-        bars = bars[bars['symbol'] == symbol]
-    bars = bars.reset_index()
-    return bars if not bars.empty else None
+    bars = bars[bars['symbol'] == symbol]
+    return bars
 
 def indicators(df):
     df["ema_fast"] = df["close"].ewm(span=EMA_FAST).mean()
@@ -93,36 +90,29 @@ def cooldown_active(symbol):
     return now_et() < cooldowns[symbol]
 
 def place_trade(symbol, side, price, atr, equity):
-    risk_dollars = equity * MAX_RISK_PER_TRADE
-    stop_distance = atr * ATR_STOP_MULT
-    qty = max(int(risk_dollars / stop_distance), 1)
-
-    if side == "buy":
-        stop = round(price - stop_distance, 2)
-        tp = round(price + atr * ATR_TP_MULT, 2)
-        if stop >= price:
-            stop = round(price - 0.01, 2)
-        if tp <= price:
-            tp = round(price + 0.01, 2)
-    else:
-        stop = round(price + stop_distance, 2)
-        tp = round(price - atr * ATR_TP_MULT, 2)
-        if stop <= price:
-            stop = round(price + 0.01, 2)
-        if tp >= price:
-            tp = round(price - 0.01, 2)
-
-    if side == "buy" and not (stop < price < tp):
-        logging.warning(f"{symbol} | Invalid BUY bracket: stop={stop}, entry={price}, tp={tp}")
-        cooldowns[symbol] = now_et() + timedelta(minutes=COOLDOWN_MINUTES)
-        return
-    if side == "sell" and not (tp < price < stop):
-        logging.warning(f"{symbol} | Invalid SELL bracket: stop={stop}, entry={price}, tp={tp}")
-        cooldowns[symbol] = now_et() + timedelta(minutes=COOLDOWN_MINUTES)
-        return
-
-    logging.info(f"{symbol} | {side.upper()} | qty={qty} entry={price} stop={stop} tp={tp}")
     try:
+        risk_dollars = equity * MAX_RISK_PER_TRADE
+        stop_distance = atr * ATR_STOP_MULT
+        qty = max(int(risk_dollars / stop_distance), 1)
+
+        if side == "buy":
+            stop = round(price - stop_distance, 2)
+            tp = round(price + atr * ATR_TP_MULT, 2)
+            # Ensure valid bracket prices
+            if tp <= price:
+                tp = round(price + 0.01, 2)
+            if stop >= price:
+                stop = round(price - 0.01, 2)
+        else:
+            stop = round(price + stop_distance, 2)
+            tp = round(price - atr * ATR_TP_MULT, 2)
+            if tp >= price:
+                tp = round(price - 0.01, 2)
+            if stop <= price:
+                stop = round(price + 0.01, 2)
+
+        logging.info(f"{symbol} | {side.upper()} | qty={qty} entry={price} stop={stop} tp={tp}")
+
         api.submit_order(
             symbol=symbol,
             qty=qty,
@@ -133,17 +123,26 @@ def place_trade(symbol, side, price, atr, equity):
             stop_loss={"stop_price": stop},
             take_profit={"limit_price": tp}
         )
-        cooldowns[symbol] = now_et() + timedelta(minutes=COOLDOWN_MINUTES)
-    except Exception as e:
-        logging.error(f"{symbol} ORDER FAILED — {e}")
+
         cooldowns[symbol] = now_et() + timedelta(minutes=COOLDOWN_MINUTES)
 
+    except APIError as e:
+        logging.error(f"{symbol} ORDER FAILED — {e}")
+
+# ================= CORE CYCLE =================
 def run_cycle():
-    if not market_open() or not in_trade_window():
+    if not market_open():
+        logging.info("Market closed — skipping")
         return
+
+    if not in_trade_window():
+        logging.info("Outside trade window — skipping")
+        return
+
     equity = get_equity()
     daily_pnl = get_daily_pnl()
     logging.info(f"Equity: {equity:.2f} | Daily PnL: {daily_pnl:.2%}")
+
     if daily_pnl <= MAX_DAILY_LOSS:
         logging.warning("DAILY LOSS LIMIT HIT — STOPPING")
         return
@@ -156,21 +155,20 @@ def run_cycle():
                 continue
 
             df = get_bars(symbol)
-            if df is None:
-                logging.info(f"{symbol}: no data — skip")
-                continue
-
             df = indicators(df)
+            if df.empty or len(df) < 2:
+                continue
             last = df.iloc[-1]
+            prev = df.iloc[-2]
+
             price = last["close"]
             atr = last["atr"]
-
-            if atr is None or atr == 0:
+            if not atr or atr <= 0:
                 continue
 
             trend_up = last["ema_fast"] > last["ema_slow"]
             trend_down = last["ema_fast"] < last["ema_slow"]
-            momentum = abs(price - df.iloc[-2]["close"]) > atr * ATR_ENTRY_MULT
+            momentum = abs(price - prev["close"]) > atr * ATR_ENTRY_MULT
 
             if not momentum:
                 continue
@@ -183,10 +181,8 @@ def run_cycle():
         except Exception as e:
             logging.error(f"{symbol} ERROR — {e}")
 
+# ================= MAIN =================
 if __name__ == "__main__":
     logging.info("BOT START")
-    start = time.time()
-    while time.time() - start < LOOP_MINUTES * 60:
-        run_cycle()
-        time.sleep(SLEEP_SECONDS)
+    run_cycle()
     logging.info("BOT END")
