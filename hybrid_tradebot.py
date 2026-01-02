@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timedelta
 import pytz
 import pandas as pd
-from alpaca_trade_api import REST, tradeapi
+from alpaca_trade_api.rest import REST, APIError  # Correct import
 
 # ================= CONFIG =================
 SYMBOLS = ["XLE", "XLF", "XLV", "XLY", "IWM"]
@@ -43,8 +43,7 @@ def now_et():
     return datetime.now(eastern)
 
 def market_open():
-    clock = api.get_clock()
-    return clock.is_open
+    return api.get_clock().is_open
 
 def in_trade_window():
     t = now_et().time()
@@ -81,7 +80,7 @@ def position_exists(symbol):
     try:
         api.get_position(symbol)
         return True
-    except tradeapi.rest.APIError:
+    except APIError:
         return False
 
 def cooldown_active(symbol):
@@ -125,7 +124,7 @@ def place_trade(symbol, side, price, atr, equity):
 
         cooldowns[symbol] = now_et() + timedelta(minutes=COOLDOWN_MINUTES)
 
-    except tradeapi.rest.APIError as e:
+    except APIError as e:
         logging.error(f"{symbol} ORDER FAILED — {e}")
 
 # ================= CORE CYCLE =================
