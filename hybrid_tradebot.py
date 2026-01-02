@@ -10,10 +10,10 @@ from alpaca_trade_api import REST
 
 SYMBOLS = ["XLE", "XLF", "XLV", "XLY", "IWM"]
 
-MAX_RISK_PER_TRADE = 0.01
-MAX_DAILY_LOSS = -0.02
-COOLDOWN_MINUTES = 10
+MAX_RISK_PER_TRADE = 0.01      # 1% equity per trade
+MAX_DAILY_LOSS = -0.02         # -2% daily kill switch
 
+COOLDOWN_MINUTES = 10
 LOOP_MINUTES = 15
 SLEEP_SECONDS = 60
 
@@ -21,9 +21,9 @@ EMA_FAST = 9
 EMA_SLOW = 21
 ATR_PERIOD = 14
 
-ATR_ENTRY_MULT = 0.2
-ATR_STOP_MULT = 0.5
-ATR_TP_MULT = 0.8
+ATR_ENTRY_MULT = 0.25
+ATR_STOP_MULT = 0.6
+ATR_TP_MULT = 1.0
 
 # ==========================================
 
@@ -32,22 +32,14 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-# ===== ENV VARS =====
+# ===== ENV VARS (MATCH YOUR SECRETS) =====
+
 API_KEY = os.getenv("ALPACA_API_KEY")
 API_SECRET = os.getenv("ALPACA_SECRET_KEY")
 BASE_URL = os.getenv("ALPACA_BASE_URL")
 
-missing = []
-if not API_KEY:
-    missing.append("ALPACA_API_KEY")
-if not API_SECRET:
-    missing.append("ALPACA_SECRET_KEY")
-if not BASE_URL:
-    missing.append("ALPACA_BASE_URL")
-
-if missing:
-    logging.error(f"Missing environment variables: {missing}")
-    raise RuntimeError("Alpaca credentials not loaded")
+if not API_KEY or not API_SECRET or not BASE_URL:
+    raise RuntimeError("Missing Alpaca environment variables")
 
 api = REST(API_KEY, API_SECRET, BASE_URL)
 
@@ -65,10 +57,9 @@ def market_open():
 def in_trade_window():
     t = now_et().time()
     return (
-        (t >= datetime.strptime("09:35", "%H:%M").time() and
-         t <= datetime.strptime("11:30", "%H:%M").time()) or
-        (t >= datetime.strptime("13:30", "%H:%M").time() and
-         t <= datetime.strptime("15:55", "%H:%M").time())
+        datetime.strptime("09:35", "%H:%M").time() <= t <= datetime.strptime("11:30", "%H:%M").time()
+        or
+        datetime.strptime("13:30", "%H:%M").time() <= t <= datetime.strptime("15:50", "%H:%M").time()
     )
 
 def get_equity():
@@ -77,23 +68,6 @@ def get_equity():
 def get_daily_pnl():
     acct = api.get_account()
     return float(acct.equity) / float(acct.last_equity) - 1
-
-def get_bars(symbol):
-    df = api.get_bars(symbol, "1Min", limit=120).df
-    return df[df["symbol"] == symbol]
-
-def indicators(df):
-    df["ema_fast"] = df["close"].ewm(span=EMA_FAST).mean()
-    df["ema_slow"] = df["close"].ewm(span=EMA_SLOW).mean()
-
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - df["close"].shift()).abs(),
-        (df["low"] - df["close"].shift()).abs()
-    ], axis=1).max(axis=1)
-
-    df["atr"] = tr.rolling(ATR_PERIOD).mean()
-    return df
 
 def position_exists(symbol):
     try:
@@ -105,22 +79,50 @@ def position_exists(symbol):
 def cooldown_active(symbol):
     return symbol in cooldowns and now_et() < cooldowns[symbol]
 
+# ========= DATA =========
+
+def get_bars(symbol):
+    bars = api.get_bars(symbol, "1Min", limit=120).df
+    bars = bars.copy()
+    bars.index = pd.to_datetime(bars.index)
+    return bars
+
+def add_indicators(df):
+    df["ema_fast"] = df["close"].ewm(span=EMA_FAST).mean()
+    df["ema_slow"] = df["close"].ewm(span=EMA_SLOW).mean()
+
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3
+    df["vwap"] = (typical_price * df["volume"]).cumsum() / df["volume"].cumsum()
+
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift()).abs(),
+        (df["low"] - df["close"].shift()).abs()
+    ], axis=1).max(axis=1)
+
+    df["atr"] = tr.rolling(ATR_PERIOD).mean()
+    return df
+
+# ========= TRADING =========
+
 def place_trade(symbol, side, price, atr, equity):
-    risk = equity * MAX_RISK_PER_TRADE
+    risk_dollars = equity * MAX_RISK_PER_TRADE
     stop_dist = atr * ATR_STOP_MULT
-    qty = int(risk / stop_dist)
+    qty = int(risk_dollars / stop_dist)
 
     if qty <= 0:
         return
 
     if side == "buy":
-        stop = round(price - stop_dist, 2)
-        tp = round(price + atr * ATR_TP_MULT, 2)
+        stop_price = round(price - stop_dist, 2)
+        tp_price = round(price + atr * ATR_TP_MULT, 2)
     else:
-        stop = round(price + stop_dist, 2)
-        tp = round(price - atr * ATR_TP_MULT, 2)
+        stop_price = round(price + stop_dist, 2)
+        tp_price = round(price - atr * ATR_TP_MULT, 2)
 
-    logging.info(f"{symbol} {side.upper()} qty={qty} entry={price} stop={stop} tp={tp}")
+    logging.info(
+        f"{symbol} | {side.upper()} | qty={qty} entry={price:.2f} stop={stop_price} tp={tp_price}"
+    )
 
     api.submit_order(
         symbol=symbol,
@@ -129,13 +131,13 @@ def place_trade(symbol, side, price, atr, equity):
         type="market",
         time_in_force="day",
         order_class="bracket",
-        stop_loss={"stop_price": stop},
-        take_profit={"limit_price": tp}
+        stop_loss={"stop_price": stop_price},
+        take_profit={"limit_price": tp_price}
     )
 
     cooldowns[symbol] = now_et() + timedelta(minutes=COOLDOWN_MINUTES)
 
-# ==========================================
+# ========= MAIN LOOP =========
 
 def run_cycle():
     if not market_open() or not in_trade_window():
@@ -147,36 +149,44 @@ def run_cycle():
     logging.info(f"Equity: {equity:.2f} | Daily PnL: {daily_pnl:.2%}")
 
     if daily_pnl <= MAX_DAILY_LOSS:
-        logging.warning("DAILY LOSS LIMIT HIT — HALTING")
+        logging.warning("DAILY LOSS LIMIT HIT — STOPPING TRADES")
         return
 
     for symbol in SYMBOLS:
         try:
-            if position_exists(symbol) or cooldown_active(symbol):
+            if position_exists(symbol):
                 continue
 
-            df = indicators(get_bars(symbol))
+            if cooldown_active(symbol):
+                continue
+
+            df = add_indicators(get_bars(symbol))
             last = df.iloc[-1]
             prev = df.iloc[-2]
 
             atr = last["atr"]
-            if atr <= 0:
+            if pd.isna(atr) or atr <= 0:
                 continue
 
-            move = abs(last["close"] - prev["close"])
-            if move < atr * ATR_ENTRY_MULT:
+            price = last["close"]
+            momentum = abs(price - prev["close"]) > atr * ATR_ENTRY_MULT
+
+            if not momentum:
                 continue
 
-            if last["ema_fast"] > last["ema_slow"]:
-                place_trade(symbol, "buy", last["close"], atr, equity)
+            trend_up = last["ema_fast"] > last["ema_slow"]
+            trend_down = last["ema_fast"] < last["ema_slow"]
 
-            elif last["ema_fast"] < last["ema_slow"]:
-                place_trade(symbol, "sell", last["close"], atr, equity)
+            if trend_up and price > last["vwap"]:
+                place_trade(symbol, "buy", price, atr, equity)
+
+            elif trend_down and price < last["vwap"]:
+                place_trade(symbol, "sell", price, atr, equity)
 
         except Exception as e:
             logging.error(f"{symbol} ERROR — {e}")
 
-# ==========================================
+# ========= ENTRY =========
 
 if __name__ == "__main__":
     logging.info("BOT START")
