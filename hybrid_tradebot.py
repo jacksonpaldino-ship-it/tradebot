@@ -1,4 +1,5 @@
 import os
+import time
 import logging
 from datetime import datetime, timedelta
 import pytz
@@ -6,10 +7,13 @@ import pandas as pd
 from alpaca_trade_api import REST
 
 # ================= CONFIG =================
+
 SYMBOLS = ["XLE", "XLF", "XLV", "XLY", "IWM"]
-MAX_RISK_PER_TRADE = 0.01      # 1% equity
+MAX_RISK_PER_TRADE = 0.01      # 1% of equity per trade
 MAX_DAILY_LOSS = -0.02         # -2% daily kill switch
 COOLDOWN_MINUTES = 10
+LOOP_MINUTES = 15
+SLEEP_SECONDS = 60
 
 EMA_FAST = 9
 EMA_SLOW = 21
@@ -19,7 +23,6 @@ ATR_ENTRY_MULT = 0.25
 ATR_STOP_MULT = 0.5
 ATR_TP_MULT = 0.75
 
-PRICE_BUFFER = 0.02  # buffer to prevent Alpaca order rejections
 # ==========================================
 
 logging.basicConfig(
@@ -27,7 +30,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-# ================== ALPACA ==================
+# Alpaca environment variables
 API_KEY = os.getenv("ALPACA_API_KEY")
 API_SECRET = os.getenv("ALPACA_SECRET_KEY")
 BASE_URL = os.getenv("ALPACA_BASE_URL")
@@ -36,6 +39,7 @@ if not API_KEY or not API_SECRET or not BASE_URL:
     raise RuntimeError("Missing Alpaca environment variables")
 
 api = REST(API_KEY, API_SECRET, BASE_URL)
+
 eastern = pytz.timezone("America/New_York")
 cooldowns = {}
 
@@ -65,9 +69,13 @@ def get_daily_pnl():
     return float(acct.equity) / float(acct.last_equity) - 1
 
 def get_bars(symbol):
-    bars = api.get_bars(symbol, "1Min", limit=100).df
-    bars = bars[bars['symbol'] == symbol]
-    return bars
+    bars = api.get_bars(symbol, timeframe="1Min", limit=100).df
+    if bars.empty:
+        return None
+    if 'symbol' in bars.columns:
+        bars = bars[bars['symbol'] == symbol]
+    bars = bars.reset_index()
+    return bars if not bars.empty else None
 
 def indicators(df):
     df["ema_fast"] = df["close"].ewm(span=EMA_FAST).mean()
@@ -95,21 +103,19 @@ def cooldown_active(symbol):
 
 def place_trade(symbol, side, price, atr, equity):
     risk_dollars = equity * MAX_RISK_PER_TRADE
-    stop_dist = atr * ATR_STOP_MULT
-    qty = int(risk_dollars / stop_dist) if stop_dist > 0 else 0
-    if qty <= 0:
-        logging.info(f"{symbol} | qty too low, skip")
-        return
+    stop_distance = atr * ATR_STOP_MULT
+    qty = max(int(risk_dollars / stop_distance), 1)
 
-    # Calculate bracket order prices with buffer
     if side == "buy":
-        stop = round(price - max(stop_dist, PRICE_BUFFER), 2)
-        tp = round(price + max(atr * ATR_TP_MULT, PRICE_BUFFER), 2)
-        tp = max(tp, round(price + PRICE_BUFFER, 2))
+        stop = round(price - stop_distance, 2)
+        tp = round(price + atr * ATR_TP_MULT, 2)
+        if tp <= price:
+            tp = price + 0.01  # ensure valid bracket
     else:
-        stop = round(price + max(stop_dist, PRICE_BUFFER), 2)
-        tp = round(price - max(atr * ATR_TP_MULT, PRICE_BUFFER), 2)
-        tp = min(tp, round(price - PRICE_BUFFER, 2))
+        stop = round(price + stop_distance, 2)
+        tp = round(price - atr * ATR_TP_MULT, 2)
+        if tp >= price:
+            tp = price - 0.01  # ensure valid bracket
 
     logging.info(f"{symbol} | {side.upper()} | qty={qty} entry={price} stop={stop} tp={tp}")
 
@@ -132,7 +138,6 @@ def place_trade(symbol, side, price, atr, equity):
 
 def run_cycle():
     if not market_open() or not in_trade_window():
-        logging.info("Market closed or outside trade window")
         return
 
     equity = get_equity()
@@ -146,22 +151,27 @@ def run_cycle():
     for symbol in SYMBOLS:
         try:
             if position_exists(symbol):
-                logging.info(f"{symbol}: already in position — skip")
                 continue
             if cooldown_active(symbol):
-                logging.info(f"{symbol}: cooldown active — skip")
                 continue
 
-            df = indicators(get_bars(symbol))
+            df = get_bars(symbol)
+            if df is None:
+                logging.info(f"{symbol}: no data — skip")
+                continue
+
+            df = indicators(df)
             last = df.iloc[-1]
             price = last["close"]
             atr = last["atr"]
+
             if atr is None or atr == 0:
                 continue
 
             trend_up = last["ema_fast"] > last["ema_slow"]
             trend_down = last["ema_fast"] < last["ema_slow"]
             momentum = abs(price - df.iloc[-2]["close"]) > atr * ATR_ENTRY_MULT
+
             if not momentum:
                 continue
 
@@ -177,5 +187,8 @@ def run_cycle():
 
 if __name__ == "__main__":
     logging.info("BOT START")
-    run_cycle()
+    start = time.time()
+    while time.time() - start < LOOP_MINUTES * 60:
+        run_cycle()
+        time.sleep(SLEEP_SECONDS)
     logging.info("BOT END")
