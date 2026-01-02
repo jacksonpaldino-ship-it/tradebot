@@ -24,7 +24,7 @@ jobs:
 
       - name: Run tradebot
         env:
-          LPACA_API_KEY: ${{ secrets.LPACA_API_KEY }}
+          LPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
         run: |
