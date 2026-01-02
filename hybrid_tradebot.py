@@ -16,17 +16,15 @@ EMA_FAST = 9
 EMA_SLOW = 21
 ATR_PERIOD = 14
 
-ATR_ENTRY_MULT = 0.25
 ATR_STOP_MULT = 0.5
 ATR_TP_MULT = 0.75
-# ==========================================
+# =========================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-# ================= API =================
 api = REST(
     os.environ["ALPACA_API_KEY"],
     os.environ["ALPACA_SECRET_KEY"],
@@ -60,7 +58,7 @@ def get_daily_pnl():
 
 def get_bars(symbol):
     df = api.get_bars(symbol, "1Min", limit=100).df
-    return df.copy() if not df.empty else None
+    return df if not df.empty else None
 
 def indicators(df):
     df["ema_fast"] = df["close"].ewm(span=EMA_FAST).mean()
@@ -88,42 +86,67 @@ def position_exists(symbol):
 def cooldown_active(symbol):
     return symbol in cooldowns and now_et() < cooldowns[symbol]
 
-def place_trade(symbol, side, price, atr, equity):
+# ================= ORDER LOGIC =================
+def place_trade(symbol, side, atr, equity):
     try:
         risk = equity * MAX_RISK_PER_TRADE
         stop_dist = atr * ATR_STOP_MULT
         qty = max(int(risk / stop_dist), 1)
 
-        if side == "buy":
-            stop = round(price - stop_dist, 2)
-            tp = round(price + atr * ATR_TP_MULT, 2)
-        else:
-            stop = round(price + stop_dist, 2)
-            tp = round(price - atr * ATR_TP_MULT, 2)
+        logging.info(f"{symbol} | {side.upper()} | qty={qty}")
 
-        if side == "buy":
-            stop = min(stop, price - 0.01)
-            tp = max(tp, price + 0.01)
-        else:
-            stop = max(stop, price + 0.01)
-            tp = min(tp, price - 0.01)
-
-        logging.info(f"{symbol} | {side.upper()} | qty={qty} entry={price} stop={stop} tp={tp}")
-
-        api.submit_order(
+        # 1️⃣ MARKET ENTRY
+        order = api.submit_order(
             symbol=symbol,
             qty=qty,
             side=side,
             type="market",
-            time_in_force="day",
-            order_class="bracket",
-            stop_loss={"stop_price": stop},
-            take_profit={"limit_price": tp},
+            time_in_force="day"
+        )
+
+        # 2️⃣ WAIT FOR FILL
+        filled = None
+        for _ in range(10):
+            filled = api.get_order(order.id)
+            if filled.filled_avg_price:
+                break
+
+        if not filled or not filled.filled_avg_price:
+            raise Exception("Order not filled")
+
+        base = float(filled.filled_avg_price)
+
+        # 3️⃣ CALCULATE VALID STOPS
+        if side == "buy":
+            stop = round(base - stop_dist, 2)
+            tp = round(base + atr * ATR_TP_MULT, 2)
+        else:
+            stop = round(base + stop_dist, 2)
+            tp = round(base - atr * ATR_TP_MULT, 2)
+
+        # 4️⃣ EXIT ORDERS (SEPARATE)
+        api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side="sell" if side == "buy" else "buy",
+            type="stop",
+            stop_price=stop,
+            time_in_force="day"
+        )
+
+        api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side="sell" if side == "buy" else "buy",
+            type="limit",
+            limit_price=tp,
+            time_in_force="day"
         )
 
         cooldowns[symbol] = now_et() + timedelta(minutes=COOLDOWN_MINUTES)
+        logging.info(f"{symbol} FILLED @ {base} | SL={stop} TP={tp}")
 
-    except APIError as e:
+    except Exception as e:
         logging.error(f"{symbol} ORDER FAILED — {e}")
 
 # ================= MAIN =================
@@ -140,35 +163,24 @@ def run():
         return
 
     for symbol in SYMBOLS:
-        try:
-            if position_exists(symbol) or cooldown_active(symbol):
-                continue
+        if position_exists(symbol) or cooldown_active(symbol):
+            continue
 
-            df = get_bars(symbol)
-            if df is None or len(df) < 30:
-                continue
+        df = get_bars(symbol)
+        if df is None or len(df) < 30:
+            continue
 
-            df = indicators(df)
-            last, prev = df.iloc[-1], df.iloc[-2]
+        df = indicators(df)
+        last, prev = df.iloc[-1], df.iloc[-2]
 
-            if pd.isna(last["atr"]) or last["atr"] <= 0:
-                continue
+        if pd.isna(last["atr"]):
+            continue
 
-            price = last["close"]
-            atr = last["atr"]
+        if last["ema_fast"] > last["ema_slow"] and last["close"] > last["vwap"]:
+            place_trade(symbol, "buy", last["atr"], equity)
 
-            momentum = abs(price - prev["close"]) > atr * ATR_ENTRY_MULT
-            if not momentum:
-                continue
-
-            if last["ema_fast"] > last["ema_slow"] and price > last["vwap"]:
-                place_trade(symbol, "buy", price, atr, equity)
-
-            elif last["ema_fast"] < last["ema_slow"] and price < last["vwap"]:
-                place_trade(symbol, "sell", price, atr, equity)
-
-        except Exception as e:
-            logging.error(f"{symbol} ERROR — {e}")
+        elif last["ema_fast"] < last["ema_slow"] and last["close"] < last["vwap"]:
+            place_trade(symbol, "sell", last["atr"], equity)
 
 if __name__ == "__main__":
     logging.info("BOT START")
