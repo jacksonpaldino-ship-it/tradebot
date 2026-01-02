@@ -1,31 +1,24 @@
-name: TradeBot
+name: Trade Bot
 
 on:
   schedule:
-    - cron: "*/15 14-21 * * 1-5"   # market hours UTC
+    - cron: "*/15 13-21 * * 1-5"  # every 15 min, market hours UTC
   workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-
-    env:
-      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
-      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-      ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          pip install alpaca-trade-api pandas pytz
+      - run: pip install alpaca-trade-api pandas pytz
 
-      - name: Run bot
-        run: python hybrid_tradebot.py
+      - run: python hybrid_tradebot.py
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
