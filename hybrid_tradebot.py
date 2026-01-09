@@ -1,217 +1,219 @@
 import os
+import math
 import logging
-from datetime import datetime, time as dtime
+from datetime import datetime, time
 import pytz
 import pandas as pd
+import numpy as np
+
 from alpaca_trade_api import REST
 
-# ================= CONFIG =================
+# =========================
+# CONFIG
+# =========================
+API_KEY = os.getenv("ALPACA_API_KEY")
+SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+BASE_URL = os.getenv("ALPACA_BASE_URL")
 
 SYMBOLS = ["XLE", "XLF", "XLV", "XLY", "IWM"]
 
-# Risk & sizing (SAFE for $100k, scales to $2k automatically)
-RISK_PER_TRADE = 0.002        # 0.2% per trade
-MAX_POSITION_PCT = 0.10       # max 10% equity per symbol
-MAX_DAILY_LOSS = -0.01        # -1% daily kill switch
+TIMEZONE = pytz.timezone("America/New_York")
 
-# Indicators (loosened so it actually trades)
-EMA_FAST = 8
-EMA_SLOW = 20
-ATR_PERIOD = 14
+ACCOUNT_RISK_PCT = 0.0025
+MAX_TRADES_PER_DAY = 3
+MAX_SYMBOL_TRADES = 1
+MAX_GROSS_EXPOSURE = 0.20
 
-# ATR based exits (valid for Alpaca constraints)
-STOP_ATR = 0.6
-TP_ATR = 1.0
+ATR_MULT_STOP = 1.0
+ATR_MULT_TP = 1.5
+ADX_MIN = 20
 
-# Trading windows (NY time)
-MORNING_START = dtime(9, 35)
-MORNING_END   = dtime(11, 30)
-AFTERNOON_START = dtime(13, 30)
-AFTERNOON_END   = dtime(15, 45)
-FORCE_FLATTEN_TIME = dtime(15, 55)
+FORCE_FLATTEN_TIME = time(15, 55)
 
-# =========================================
+BAR_TIMEFRAME = "5Min"
+LOOKBACK = 100
 
+# =========================
+# LOGGING
+# =========================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-# ENV VARS (correct names)
-API_KEY = os.getenv("ALPACA_API_KEY")
-API_SECRET = os.getenv("ALPACA_SECRET_KEY")
-BASE_URL = os.getenv("ALPACA_BASE_URL")
+# =========================
+# API
+# =========================
+api = REST(API_KEY, SECRET_KEY, BASE_URL, api_version="v2")
 
-if not API_KEY or not API_SECRET or not BASE_URL:
-    raise RuntimeError("Missing Alpaca environment variables")
+# =========================
+# UTILS
+# =========================
+def ny_now():
+    return datetime.now(TIMEZONE)
 
-api = REST(API_KEY, API_SECRET, BASE_URL)
-eastern = pytz.timezone("America/New_York")
+def market_near_close():
+    return ny_now().time() >= FORCE_FLATTEN_TIME
 
-# =========================================
+def safe_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
 
-def now_et():
-    return datetime.now(eastern)
+# =========================
+# INDICATORS
+# =========================
+def indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
 
-def market_open():
-    return api.get_clock().is_open
-
-def in_trade_window():
-    t = now_et().time()
-    return (
-        MORNING_START <= t <= MORNING_END or
-        AFTERNOON_START <= t <= AFTERNOON_END
-    )
-
-def near_close():
-    return now_et().time() >= FORCE_FLATTEN_TIME
-
-def get_equity():
-    return float(api.get_account().equity)
-
-def daily_pnl():
-    acct = api.get_account()
-    return float(acct.equity) / float(acct.last_equity) - 1
-
-def get_bars(symbol):
-    df = api.get_bars(symbol, "1Min", limit=120).df
-    df = df.reset_index()
-    return df
-
-def indicators(df):
-    df["ema_fast"] = df["close"].ewm(span=EMA_FAST).mean()
-    df["ema_slow"] = df["close"].ewm(span=EMA_SLOW).mean()
+    df["ema9"] = df["close"].ewm(span=9).mean()
+    df["ema21"] = df["close"].ewm(span=21).mean()
 
     tr = pd.concat([
         df["high"] - df["low"],
-        (df["high"] - df["close"].shift()).abs(),
-        (df["low"] - df["close"].shift()).abs()
+        abs(df["high"] - df["close"].shift()),
+        abs(df["low"] - df["close"].shift())
     ], axis=1).max(axis=1)
 
-    df["atr"] = tr.rolling(ATR_PERIOD).mean()
+    df["atr"] = tr.rolling(14).mean()
+
+    up = df["high"].diff()
+    down = -df["low"].diff()
+    plus_dm = np.where((up > down) & (up > 0), up, 0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0)
+
+    tr14 = tr.rolling(14).sum()
+    plus_di = 100 * (pd.Series(plus_dm).rolling(14).sum() / tr14)
+    minus_di = 100 * (pd.Series(minus_dm).rolling(14).sum() / tr14)
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
+    df["adx"] = dx.rolling(14).mean()
+
+    df["vwap"] = (df["volume"] * (df["high"] + df["low"] + df["close"]) / 3).cumsum() / df["volume"].cumsum()
+
     return df
 
-def get_position_qty(symbol):
-    try:
-        pos = api.get_position(symbol)
-        return int(float(pos.qty))
-    except:
-        return 0
+# =========================
+# DATA
+# =========================
+def get_bars(symbol):
+    bars = api.get_bars(symbol, BAR_TIMEFRAME, limit=LOOKBACK).df
+    if bars.empty:
+        return None
+    return indicators(bars)
 
+# =========================
+# RISK
+# =========================
+def calc_qty(price, atr, equity):
+    risk_dollars = equity * ACCOUNT_RISK_PCT
+    stop_dist = max(atr * ATR_MULT_STOP, price * 0.002)
+    qty = math.floor(risk_dollars / stop_dist)
+    return max(qty, 0)
+
+# =========================
+# POSITIONS
+# =========================
 def flatten_all():
     positions = api.list_positions()
     for p in positions:
-        qty = int(float(p.qty))
+        qty = abs(int(float(p.qty)))
         if qty == 0:
             continue
-
-        side = "sell" if qty > 0 else "buy"
+        side = "sell" if p.side == "long" else "buy"
+        logging.info(f"FORCE CLOSE {p.symbol} qty={qty}")
         try:
-            logging.info(f"FORCE CLOSE {p.symbol} qty={qty}")
             api.submit_order(
                 symbol=p.symbol,
-                qty=abs(qty),
+                qty=qty,
                 side=side,
                 type="market",
                 time_in_force="day"
             )
         except Exception as e:
-            logging.warning(f"Flatten skip {p.symbol}: {e}")
+            logging.error(f"FORCE CLOSE FAILED {p.symbol} — {e}")
 
-def position_size(symbol, atr, price, equity):
-    risk_dollars = equity * RISK_PER_TRADE
-    raw_qty = int(risk_dollars / (atr * STOP_ATR))
+# =========================
+# PERFORMANCE LOGGING
+# =========================
+def log_performance():
+    acct = api.get_account()
+    equity = safe_float(acct.equity)
+    last = safe_float(acct.last_equity)
+    pnl = equity - last
+    pct = (pnl / last * 100) if last else 0
+    logging.info(f"Equity: {equity:.2f} | Daily PnL: {pct:.2f}%")
 
-    max_qty = int((equity * MAX_POSITION_PCT) / price)
-    return max(0, min(raw_qty, max_qty))
-
-def submit_bracket(symbol, side, qty, price, atr):
-    if qty <= 0:
-        return
-
-    if side == "buy":
-        stop = round(price - atr * STOP_ATR, 2)
-        tp   = round(price + atr * TP_ATR, 2)
-        if tp <= price + 0.01:
-            tp = round(price + 0.02, 2)
-    else:
-        stop = round(price + atr * STOP_ATR, 2)
-        tp   = round(price - atr * TP_ATR, 2)
-        if tp >= price - 0.01:
-            tp = round(price - 0.02, 2)
-
-    logging.info(f"{symbol} | {side.upper()} | qty={qty}")
-
-    api.submit_order(
-        symbol=symbol,
-        qty=qty,
-        side=side,
-        type="market",
-        time_in_force="day",
-        order_class="bracket",
-        stop_loss={"stop_price": stop},
-        take_profit={"limit_price": tp}
-    )
-
-# =========================================
-
+# =========================
+# MAIN
+# =========================
 def run():
     logging.info("BOT START")
 
-    if not market_open():
-        logging.info("Market closed")
-        return
-
-    if near_close():
+    if market_near_close():
         logging.info("Market near close — flattening")
         flatten_all()
         return
 
-    equity = get_equity()
-    pnl = daily_pnl()
-    logging.info(f"Equity: {equity:.2f} | Daily PnL: {pnl:.2%}")
+    acct = api.get_account()
+    equity = safe_float(acct.equity)
+    log_performance()
 
-    if pnl <= MAX_DAILY_LOSS:
-        logging.warning("DAILY LOSS LIMIT — FLATTENING")
-        flatten_all()
-        return
+    positions = {p.symbol: p for p in api.list_positions()}
+    trades_today = len(api.list_orders(status="all", after=ny_now().date().isoformat()))
 
-    if not in_trade_window():
-        logging.info("Outside trade window")
+    gross_exposure = sum(abs(float(p.market_value)) for p in positions.values())
+    if gross_exposure / equity > MAX_GROSS_EXPOSURE:
+        logging.info("Exposure cap hit — skip")
         return
 
     for symbol in SYMBOLS:
+        if trades_today >= MAX_TRADES_PER_DAY:
+            break
+        if symbol in positions:
+            continue
+
+        df = get_bars(symbol)
+        if df is None or len(df) < 30:
+            continue
+
+        last = df.iloc[-1]
+
+        if last["adx"] < ADX_MIN:
+            continue
+
+        price = safe_float(last["close"])
+        atr = safe_float(last["atr"])
+        if atr <= 0:
+            continue
+
+        qty = calc_qty(price, atr, equity)
+        if qty <= 0:
+            continue
+
+        side = None
+        if last["ema9"] > last["ema21"] and price > last["vwap"]:
+            side = "buy"
+        elif last["ema9"] < last["ema21"] and price < last["vwap"]:
+            side = "sell"
+
+        if not side:
+            continue
+
         try:
-            if get_position_qty(symbol) != 0:
-                continue
-
-            df = indicators(get_bars(symbol))
-            last = df.iloc[-1]
-            prev = df.iloc[-2]
-
-            atr = last["atr"]
-            if pd.isna(atr) or atr == 0:
-                continue
-
-            price = float(api.get_latest_trade(symbol).price)
-
-            # Loosened entry logic (momentum + trend)
-            bullish = last["ema_fast"] > last["ema_slow"] and price > prev["close"]
-            bearish = last["ema_fast"] < last["ema_slow"] and price < prev["close"]
-
-            qty = position_size(symbol, atr, price, equity)
-
-            if bullish:
-                submit_bracket(symbol, "buy", qty, price, atr)
-            elif bearish:
-                submit_bracket(symbol, "sell", qty, price, atr)
-
+            api.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side=side,
+                type="market",
+                time_in_force="day"
+            )
+            trades_today += 1
+            logging.info(f"{symbol} | {side.upper()} | qty={qty}")
         except Exception as e:
-            logging.error(f"{symbol} ERROR — {e}")
+            logging.error(f"{symbol} ORDER FAILED — {e}")
 
     logging.info("BOT END")
-
-# =========================================
 
 if __name__ == "__main__":
     run()
