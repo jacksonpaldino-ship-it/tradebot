@@ -1,167 +1,223 @@
 import os
+import time
 import logging
-from datetime import datetime, time
-import pytz
+from datetime import datetime, timezone
+
 import pandas as pd
 from alpaca_trade_api import REST
 
-# ====================== CONFIG ======================
+# =========================
+# CONFIG (CHANGE THESE ONLY)
+# =========================
 
 SYMBOLS = ["XLE", "XLF", "XLV", "XLY", "IWM"]
 
-MAX_NOTIONAL_PER_TRADE = 2500      # <-- change to 300–500 for $2k account
-MAX_TOTAL_EXPOSURE = 5000          # total intraday exposure cap
-MAX_DAILY_LOSS_PCT = -0.01         # -1% kill switch
-MIN_AVG_VOLUME = 1_000_000
+RISK_PER_TRADE_PCT = 0.002      # 0.2% per trade (SAFE)
+MAX_POSITIONS = 2
+FLATTEN_MINUTES_BEFORE_CLOSE = 5
 
-ATR_PERIOD = 14
-STOP_ATR_MULT = 1.2
-TP_ATR_MULT = 1.5
+BAR_TIMEFRAME = "1Min"
+BAR_LIMIT = 100
 
-EASTERN = pytz.timezone("America/New_York")
-
-# ===================================================
+# =========================
+# LOGGING
+# =========================
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-api = REST(
-    os.environ["ALPACA_API_KEY"],
-    os.environ["ALPACA_SECRET_KEY"],
-    os.environ["ALPACA_BASE_URL"],
-)
+logger = logging.getLogger(__name__)
 
-# ====================== TIME LOGIC ======================
+# =========================
+# API INIT
+# =========================
 
-def now_et():
-    return datetime.now(EASTERN)
+API_KEY = os.getenv("ALPACA_API_KEY")
+API_SECRET = os.getenv("ALPACA_SECRET_KEY")
+BASE_URL = os.getenv("ALPACA_BASE_URL")
 
-def market_window():
-    t = now_et().time()
-    return time(9, 35) <= t <= time(15, 45)
+if not API_KEY or not API_SECRET or not BASE_URL:
+    raise RuntimeError("Missing Alpaca environment variables")
 
-def near_close():
-    return now_et().time() >= time(15, 50)
+api = REST(API_KEY, API_SECRET, BASE_URL, api_version="v2")
 
-# ====================== DATA ======================
+# =========================
+# UTILITIES
+# =========================
+
+def market_is_open():
+    clock = api.get_clock()
+    return clock.is_open, clock
+
+def minutes_to_close(clock):
+    delta = clock.next_close - clock.timestamp
+    return delta.total_seconds() / 60
+
+def get_equity():
+    return float(api.get_account().equity)
+
+def get_positions_dict():
+    positions = api.list_positions()
+    return {p.symbol: p for p in positions}
+
+def safe_qty(value, price):
+    if price <= 0:
+        return 0
+    return int(value // price)
+
+# =========================
+# DATA
+# =========================
 
 def get_bars(symbol):
-    df = api.get_bars(symbol, "1Min", limit=60).df
-    return df
+    bars = api.get_bars(symbol, BAR_TIMEFRAME, limit=BAR_LIMIT).df
+    if bars.empty:
+        return None
+    bars = bars.reset_index()
+    return bars
 
-def compute_atr(df):
+def compute_atr(df, period=14):
+    high = df["high"]
+    low = df["low"]
+    close = df["close"].shift(1)
+
     tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - df["close"].shift()).abs(),
-        (df["low"] - df["close"].shift()).abs()
+        high - low,
+        (high - close).abs(),
+        (low - close).abs()
     ], axis=1).max(axis=1)
-    return tr.rolling(ATR_PERIOD).mean().iloc[-1]
 
-# ====================== RISK ======================
+    return tr.rolling(period).mean()
 
-def account_state():
-    acct = api.get_account()
-    return float(acct.equity), float(acct.last_equity)
+# =========================
+# STRATEGY
+# =========================
 
-def daily_pnl_pct():
-    eq, last = account_state()
-    return eq / last - 1
+def generate_signal(df):
+    df["atr"] = compute_atr(df)
+    if df["atr"].isna().iloc[-1]:
+        return None
 
-def current_exposure():
-    exposure = 0
-    for p in api.list_positions():
-        exposure += abs(float(p.market_value))
-    return exposure
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
 
-# ====================== EXECUTION ======================
+    # Simple momentum + volatility filter
+    if last["close"] > prev["high"] and last["atr"] > df["atr"].mean():
+        return "buy"
 
-def flatten_all():
-    for p in api.list_positions():
-        side = "sell" if int(p.qty) > 0 else "buy"
-        qty = abs(int(p.qty))
-        logging.info(f"FORCE FLATTEN {p.symbol} qty={qty}")
+    if last["close"] < prev["low"] and last["atr"] > df["atr"].mean():
+        return "sell"
+
+    return None
+
+# =========================
+# ORDER EXECUTION
+# =========================
+
+def place_order(symbol, side):
+    price = float(api.get_latest_trade(symbol).price)
+    equity = get_equity()
+
+    risk_dollars = equity * RISK_PER_TRADE_PCT
+    qty = safe_qty(risk_dollars, price)
+
+    if qty <= 0:
+        logger.info(f"{symbol} | qty=0 — skip")
+        return
+
+    try:
         api.submit_order(
-            symbol=p.symbol,
+            symbol=symbol,
             qty=qty,
             side=side,
             type="market",
-            time_in_force="day"
+            time_in_force="day",
         )
+        logger.info(f"{symbol} | {side.upper()} | qty={qty}")
+    except Exception as e:
+        logger.error(f"{symbol} ORDER FAILED — {e}")
 
-def place_trade(symbol, side, atr):
-    price = api.get_latest_trade(symbol).price
-    stop_dist = atr * STOP_ATR_MULT
-    qty = int(MAX_NOTIONAL_PER_TRADE / price)
+# =========================
+# FLATTEN (SAFE)
+# =========================
 
-    if qty <= 0:
+def flatten_all():
+    positions = api.list_positions()
+    if not positions:
+        logger.info("No positions to flatten")
         return
 
-    logging.info(f"{symbol} | {side.upper()} | qty={qty}")
+    for p in positions:
+        qty = abs(int(float(p.qty)))
+        if qty == 0:
+            continue
 
-    api.submit_order(
-        symbol=symbol,
-        qty=qty,
-        side=side,
-        type="market",
-        time_in_force="day"
-    )
+        side = "sell" if p.side == "long" else "buy"
 
-# ====================== STRATEGY ======================
+        try:
+            api.submit_order(
+                symbol=p.symbol,
+                qty=qty,
+                side=side,
+                type="market",
+                time_in_force="day",
+            )
+            logger.info(f"FLATTEN {p.symbol} qty={qty}")
+        except Exception as e:
+            logger.error(f"FLATTEN FAILED {p.symbol} — {e}")
 
-def trade_signal(df):
-    ema_fast = df["close"].ewm(span=9).mean().iloc[-1]
-    ema_slow = df["close"].ewm(span=21).mean().iloc[-1]
-    price = df["close"].iloc[-1]
-
-    if ema_fast > ema_slow:
-        return "buy"
-    if ema_fast < ema_slow:
-        return "sell"
-    return None
-
-# ====================== MAIN ======================
+# =========================
+# MAIN RUN (NO LOOPS)
+# =========================
 
 def run():
-    logging.info("BOT START")
+    logger.info("BOT START")
 
-    if daily_pnl_pct() <= MAX_DAILY_LOSS_PCT:
-        logging.warning("DAILY LOSS LIMIT HIT")
+    is_open, clock = market_is_open()
+
+    if not is_open:
+        logger.info("Market closed — exiting")
+        logger.info("BOT END")
         return
 
-    if near_close():
-        logging.info("Market near close — flattening")
+    mins_to_close = minutes_to_close(clock)
+
+    if mins_to_close <= FLATTEN_MINUTES_BEFORE_CLOSE:
+        logger.info("Market near close — flattening")
         flatten_all()
+        logger.info("BOT END")
         return
 
-    if not market_window():
-        return
+    equity = get_equity()
+    logger.info(f"Equity: {equity:.2f}")
 
-    exposure = current_exposure()
-    if exposure >= MAX_TOTAL_EXPOSURE:
-        logging.info("Exposure cap hit — no new trades")
+    positions = get_positions_dict()
+
+    if len(positions) >= MAX_POSITIONS:
+        logger.info("Max positions reached — skip entries")
+        logger.info("BOT END")
         return
 
     for symbol in SYMBOLS:
-        if any(p.symbol == symbol for p in api.list_positions()):
+        if symbol in positions:
             continue
 
-        bars = get_bars(symbol)
-        if bars["volume"].mean() < MIN_AVG_VOLUME:
+        df = get_bars(symbol)
+        if df is None or len(df) < 20:
             continue
 
-        atr = compute_atr(bars)
-        if pd.isna(atr) or atr == 0:
-            continue
-
-        signal = trade_signal(bars)
+        signal = generate_signal(df)
         if signal:
-            place_trade(symbol, signal, atr)
+            place_order(symbol, signal)
+            break  # one trade per run
 
-    logging.info("BOT END")
+    logger.info("BOT END")
 
-# ====================== RUN ======================
+# =========================
+# ENTRY
+# =========================
 
 if __name__ == "__main__":
     run()
