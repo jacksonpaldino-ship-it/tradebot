@@ -1,37 +1,21 @@
-name: Intraday Trade Bot
+name: TradeBot
 
 on:
   schedule:
-    # Every 5 minutes, Monday–Friday
-    # 14:00–21:00 UTC safely covers NY session year-round
-    - cron: "*/5 14-21 * * 1-5"
-
+    - cron: "35 14-20 * * 1-5"   # every hour during NY session
   workflow_dispatch:
 
 jobs:
-  trade:
+  run:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install alpaca-trade-api pandas pytz
-
-      - name: Run trade bot (New York session)
+      - run: pip install alpaca-trade-api pandas pytz
+      - run: python hybrid_tradebot.py
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
-          TZ: America/New_York
-        run: |
-          echo "Start $(TZ='America/New_York' date)"
-          python hybrid_tradebot.py
