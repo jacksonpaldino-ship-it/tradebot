@@ -1,8 +1,16 @@
+import os
 from alpaca_trade_api import REST
 from datetime import datetime
 import pytz
 
-api = REST(api_version="v2")
+API_KEY = os.getenv("ALPACA_API_KEY")
+API_SECRET = os.getenv("ALPACA_SECRET_KEY")
+BASE_URL = os.getenv("ALPACA_BASE_URL")
+
+if not API_KEY or not API_SECRET or not BASE_URL:
+    raise RuntimeError("Missing Alpaca credentials")
+
+api = REST(API_KEY, API_SECRET, BASE_URL, api_version="v2")
 TZ = pytz.timezone("America/New_York")
 
 def run():
