@@ -1,106 +1,76 @@
 import os
-import csv
-import datetime
+import pytz
+from datetime import datetime, timedelta
 import alpaca_trade_api as tradeapi
-from colorama import Fore, Style, init
 
-init(autoreset=True)
+# ================= CONFIG =================
 
-# 🔑 Alpaca credentials (use your existing env vars)
-API_KEY = os.getenv("APCA_API_KEY_ID")
-API_SECRET = os.getenv("APCA_API_SECRET_KEY")
-BASE_URL = "https://paper-api.alpaca.markets"  # or live endpoint
+BASE_URL = "https://paper-api.alpaca.markets"
+TZ = pytz.timezone("America/New_York")
 
-api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version="v2")
+# ============== API INIT ==================
 
-def get_account_summary():
-    """Pull and display account-level P&L summary"""
-    account = api.get_account()
+api = tradeapi.REST(
+    os.environ["APCA_API_KEY_ID"],
+    os.environ["APCA_API_SECRET_KEY"],
+    BASE_URL,
+    api_version="v2"
+)
 
-    equity = float(account.equity)
-    cash = float(account.cash)
-    buying_power = float(account.buying_power)
-    portfolio_value = float(account.portfolio_value)
-    pnl_today = float(account.equity) - float(account.last_equity)
+# ============== HELPERS ===================
 
-    pnl_color = Fore.GREEN if pnl_today >= 0 else Fore.RED
-    sign = "+" if pnl_today >= 0 else "-"
+def get_account():
+    return api.get_account()
 
-    print(f"\n📊 {Style.BRIGHT}Alpaca Account Summary ({datetime.datetime.now():%Y-%m-%d %H:%M:%S})")
-    print(f"────────────────────────────────────────────────────────")
-    print(f"💰 Equity:          ${equity:,.2f}")
-    print(f"🏦 Cash:            ${cash:,.2f}")
-    print(f"⚡ Buying Power:    ${buying_power:,.2f}")
-    print(f"📈 Portfolio Value: ${portfolio_value:,.2f}")
-    print(f"📆 Daily P&L:       {pnl_color}{sign}${abs(pnl_today):,.2f}{Style.RESET_ALL}")
-    print(f"────────────────────────────────────────────────────────")
+def get_closed_trades(start, end):
+    return api.list_orders(
+        status="closed",
+        after=start.isoformat(),
+        until=end.isoformat(),
+        limit=500,
+        direction="desc"
+    )
 
-    return {
-        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "equity": equity,
-        "cash": cash,
-        "buying_power": buying_power,
-        "portfolio_value": portfolio_value,
-        "daily_pnl": pnl_today
-    }
+def calculate_pnl(start, end):
+    orders = get_closed_trades(start, end)
+    pnl = 0.0
 
-def get_positions_summary():
-    """Pull open positions and compute unrealized gains/losses"""
-    positions = api.list_positions()
+    for o in orders:
+        if o.filled_avg_price and o.qty:
+            qty = float(o.qty)
+            price = float(o.filled_avg_price)
+            side = o.side
+            value = qty * price
+            pnl += value if side == "sell" else -value
 
-    if not positions:
-        print("No open positions.\n")
-        return []
+    return pnl
 
-    print(f"{Style.BRIGHT}Current Open Positions:{Style.RESET_ALL}")
-    print("────────────────────────────────────────────────────────")
-    data = []
-    for pos in positions:
-        symbol = pos.symbol
-        qty = int(float(pos.qty))
-        market_value = float(pos.market_value)
-        unrealized_pl = float(pos.unrealized_pl)
-        unrealized_plpc = float(pos.unrealized_plpc) * 100
+# ============== MAIN ======================
 
-        color = Fore.GREEN if unrealized_pl >= 0 else Fore.RED
-        sign = "+" if unrealized_pl >= 0 else "-"
+def run():
+    now = datetime.now(TZ)
 
-        print(f"{symbol:<6} | Qty: {qty:<3} | Value: ${market_value:>8,.2f} | P/L: {color}{sign}${abs(unrealized_pl):,.2f} ({unrealized_plpc:+.2f}%){Style.RESET_ALL}")
-        data.append({
-            "symbol": symbol,
-            "qty": qty,
-            "market_value": market_value,
-            "unrealized_pl": unrealized_pl,
-            "unrealized_plpc": unrealized_plpc
-        })
+    start_day = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    start_week = start_day - timedelta(days=start_day.weekday())
+    start_month = start_day.replace(day=1)
 
-    print("────────────────────────────────────────────────────────\n")
-    return data
+    daily_pnl = calculate_pnl(start_day, now)
+    weekly_pnl = calculate_pnl(start_week, now)
+    monthly_pnl = calculate_pnl(start_month, now)
 
-def log_to_csv(account_data):
-    """Log account summary to CSV for daily tracking"""
-    file_path = "pnl_log.csv"
-    file_exists = os.path.isfile(file_path)
+    acct = get_account()
 
-    with open(file_path, mode="a", newline="") as file:
-        writer = csv.writer(file)
-        if not file_exists:
-            writer.writerow(["timestamp", "equity", "cash", "buying_power", "portfolio_value", "daily_pnl"])
-        writer.writerow([
-            account_data["timestamp"],
-            account_data["equity"],
-            account_data["cash"],
-            account_data["buying_power"],
-            account_data["portfolio_value"],
-            account_data["daily_pnl"]
-        ])
-
-def main():
-    print("=== Running P&L Tracker ===")
-    account_data = get_account_summary()
-    get_positions_summary()
-    log_to_csv(account_data)
-    print("✅ Logged to pnl_log.csv\n")
+    print("\n=== Running P&L Tracker ===\n")
+    print(f"📊 Alpaca Account Summary ({now.strftime('%Y-%m-%d %H:%M:%S %Z')})")
+    print("────────────────────────────────────────")
+    print(f"💰 Equity:          ${float(acct.equity):,.2f}")
+    print(f"🏦 Cash:            ${float(acct.cash):,.2f}")
+    print(f"⚡ Buying Power:    ${float(acct.buying_power):,.2f}")
+    print("────────────────────────────────────────")
+    print(f"📆 Daily P&L:       ${daily_pnl:,.2f}")
+    print(f"📅 Weekly P&L:      ${weekly_pnl:,.2f}")
+    print(f"🗓 Monthly P&L:     ${monthly_pnl:,.2f}")
+    print("────────────────────────────────────────\n")
 
 if __name__ == "__main__":
-    main()
+    run()
