@@ -1,180 +1,123 @@
 import os
-import time
-import pytz
 import logging
-from datetime import datetime, timedelta
-
-import alpaca_trade_api as tradeapi
+from datetime import datetime, time
+import pytz
 import pandas as pd
+from alpaca_trade_api import REST
 
-# ================= CONFIG =================
-
+# ---------------- CONFIG ----------------
 SYMBOLS = ["XLE", "XLF", "XLV", "XLY", "IWM"]
+RISK_PER_TRADE = 0.003        # 0.3% per trade (safe at 100k AND 2k)
+MAX_POSITIONS = 2
+FLATTEN_TIME = time(15, 55)   # 3:55 PM ET
+BAR_LIMIT = 100
 
-ACCOUNT_RISK_PER_TRADE = 0.002      # 0.2% of equity
-MAX_POSITIONS = 3
-COOLDOWN_MINUTES = 5
-
-MIN_ATR_DOLLARS = 0.05
-VWAP_REVERSION_ATR = 0.25
-MOMENTUM_ATR = 0.05
-
-FLATTEN_TIME = (15, 55)  # 3:55 PM ET
-MARKET_TZ = pytz.timezone("America/New_York")
-
-# ==========================================
+TZ = pytz.timezone("America/New_York")
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-api = tradeapi.REST(
-    os.environ["APCA_API_KEY_ID"],
-    os.environ["APCA_API_SECRET_KEY"],
-    base_url="https://paper-api.alpaca.markets"
-)
+api = REST(api_version="v2")
 
-last_trade_time = {}
-
-# =============== HELPERS ==================
+# ---------------- HELPERS ----------------
+def now_et():
+    return datetime.now(TZ)
 
 def market_open():
     clock = api.get_clock()
     return clock.is_open
 
-def minutes_to_close():
-    clock = api.get_clock()
-    return (clock.next_close - clock.timestamp).total_seconds() / 60
-
-def get_equity():
-    return float(api.get_account().equity)
-
-def get_positions():
-    return {p.symbol: int(p.qty) for p in api.list_positions()}
-
-def flatten_all():
-    positions = api.list_positions()
-    if not positions:
-        logging.info("No positions to flatten")
-        return
-
-    for p in positions:
-        qty = abs(int(p.qty))
-        side = "sell" if int(p.qty) > 0 else "buy"
-        if qty == 0:
-            continue
-
-        logging.info(f"FORCE FLATTEN {p.symbol} qty={qty}")
-        try:
-            api.submit_order(
-                symbol=p.symbol,
-                qty=qty,
-                side=side,
-                type="market",
-                time_in_force="day"
-            )
-        except Exception as e:
-            logging.error(f"Flatten error {p.symbol}: {e}")
-
-def cooldown_ok(symbol):
-    if symbol not in last_trade_time:
-        return True
-    return datetime.now(MARKET_TZ) - last_trade_time[symbol] > timedelta(minutes=COOLDOWN_MINUTES)
-
-# ============== STRATEGY ==================
+def near_close():
+    return now_et().time() >= FLATTEN_TIME
 
 def get_bars(symbol):
-    bars = api.get_bars(symbol, tradeapi.TimeFrame.Minute, limit=50).df
-    if bars.empty:
-        return None
+    bars = api.get_bars(symbol, "1Min", limit=BAR_LIMIT).df
+    bars.index = bars.index.tz_convert(TZ)
     return bars
 
-def should_enter(symbol):
-    bars = get_bars(symbol)
-    if bars is None or len(bars) < 20:
-        return None
+def indicators(df):
+    df["ema9"] = df["close"].ewm(span=9).mean()
+    df["ema21"] = df["close"].ewm(span=21).mean()
+    df["atr"] = (df["high"] - df["low"]).rolling(14).mean()
+    return df.dropna()
 
-    close = bars["close"]
-    high = bars["high"]
-    low = bars["low"]
-    volume = bars["volume"]
+def position_count():
+    return len(api.list_positions())
 
-    atr = (high - low).rolling(14).mean().iloc[-1]
-    if atr < MIN_ATR_DOLLARS:
-        return None
+# ---------------- RISK ----------------
+def calc_qty(price, atr):
+    acct = api.get_account()
+    equity = float(acct.equity)
+    risk_dollars = equity * RISK_PER_TRADE
+    stop_dist = max(atr, price * 0.002)  # volatility-aware
+    qty = int(risk_dollars / stop_dist)
+    return max(qty, 1)
 
-    vwap = (close * volume).sum() / volume.sum()
-    price = close.iloc[-1]
-    vwap_dist = price - vwap
-    price_change = price - close.iloc[-2]
+# ---------------- EXECUTION ----------------
+def place_trade(symbol, side, atr):
+    price = float(api.get_latest_trade(symbol).price)
+    qty = calc_qty(price, atr)
 
-    # --- HIGH FREQUENCY FIRST ---
-    vwap_reversion = abs(vwap_dist) > VWAP_REVERSION_ATR * atr and abs(price_change) < 0.05 * atr
-    if vwap_reversion:
-        return "sell" if vwap_dist > 0 else "buy"
-
-    # --- MOMENTUM SECOND ---
-    momentum = abs(price_change) > MOMENTUM_ATR * atr
-    if momentum:
-        return "buy" if price_change > 0 else "sell"
-
-    return None
-
-# ============= EXECUTION ==================
-
-def position_size(symbol, atr):
-    equity = get_equity()
-    risk_dollars = equity * ACCOUNT_RISK_PER_TRADE
-    size = int(risk_dollars / atr)
-    return max(size, 1)
-
-def enter_trade(symbol, side):
-    bars = get_bars(symbol)
-    atr = (bars["high"] - bars["low"]).rolling(14).mean().iloc[-1]
-    qty = position_size(symbol, atr)
+    if position_count() >= MAX_POSITIONS:
+        logging.info(f"{symbol} | max positions hit — skip")
+        return
 
     logging.info(f"{symbol} | {side.upper()} | qty={qty}")
 
-    try:
+    api.submit_order(
+        symbol=symbol,
+        qty=qty,
+        side=side,
+        type="market",
+        time_in_force="day"
+    )
+
+def flatten_all():
+    for pos in api.list_positions():
+        qty = abs(int(float(pos.qty)))
+        if qty == 0:
+            continue
+        side = "sell" if pos.side == "long" else "buy"
+        logging.info(f"FORCE FLATTEN {pos.symbol} qty={qty}")
         api.submit_order(
-            symbol=symbol,
+            symbol=pos.symbol,
             qty=qty,
             side=side,
             type="market",
             time_in_force="day"
         )
-        last_trade_time[symbol] = datetime.now(MARKET_TZ)
-    except Exception as e:
-        logging.error(f"Order failed {symbol}: {e}")
 
-# ================ MAIN ====================
-
+# ---------------- STRATEGY ----------------
 def run():
     logging.info("BOT START")
 
     if not market_open():
-        logging.info("Market closed — exit clean")
+        logging.info("Market closed — exit")
         return
 
-    if minutes_to_close() < 10:
+    if near_close():
         logging.info("Market near close — flattening")
         flatten_all()
         return
 
-    positions = get_positions()
+    acct = api.get_account()
+    logging.info(f"Equity: {acct.equity}")
 
     for symbol in SYMBOLS:
-        if symbol in positions:
-            continue
-        if len(positions) >= MAX_POSITIONS:
-            break
-        if not cooldown_ok(symbol):
-            continue
+        try:
+            df = indicators(get_bars(symbol))
+            last = df.iloc[-1]
 
-        signal = should_enter(symbol)
-        if signal:
-            enter_trade(symbol, signal)
+            # HIGHER-FREQUENCY LOGIC
+            if last.ema9 > last.ema21:
+                place_trade(symbol, "buy", last.atr)
+            elif last.ema9 < last.ema21:
+                place_trade(symbol, "sell", last.atr)
+
+        except Exception as e:
+            logging.error(f"{symbol} ERROR — {e}")
 
     logging.info("BOT END")
 
