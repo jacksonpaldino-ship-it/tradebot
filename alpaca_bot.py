@@ -1,93 +1,124 @@
 import os
 import asyncio
 import logging
-import json
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
+from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.live import StockDataStream
-from dotenv import load_dotenv
 
-# ------------------------------
-# Load API Keys
-# ------------------------------
+# -------------------------
+# Load environment variables
+# -------------------------
 load_dotenv()
 API_KEY = os.getenv("ALPACA_API_KEY_ID")
 API_SECRET = os.getenv("ALPACA_API_SECRET_KEY")
-BASE_URL = "https://paper-api.alpaca.markets"  # change to live if needed
+BASE_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
 
-# ------------------------------
+if not API_KEY or not API_SECRET:
+    raise ValueError("Missing Alpaca API keys")
+
+# -------------------------
 # Logging
-# ------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# -------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 logger = logging.getLogger("AlpacaBot")
 
-# ------------------------------
-# Alpaca Client
-# ------------------------------
-client = TradingClient(API_KEY, API_SECRET, paper=True)
-stream = StockDataStream(API_KEY, API_SECRET, paper=True)
+# -------------------------
+# Client Initialization
+# -------------------------
+trading_client = TradingClient(API_KEY, API_SECRET, paper=True)
+stream = StockDataStream(API_KEY, API_SECRET, base_url=BASE_URL)
 
-# ------------------------------
-# Configuration
-# ------------------------------
-SYMBOLS = ["AAPL", "TSLA"]  # Your watchlist
-MAX_LOTS_PER_TRADE = 1  # 1 share per trade for simplicity, can adjust
-STOP_LOSS_PCT = 0.02
-TAKE_PROFIT_PCT = 0.05
+# -------------------------
+# Strategy Config
+# -------------------------
+SYMBOLS = ["AAPL", "TSLA", "MSFT"]
+TRADE_SIZE = 1  # shares per trade
+STOP_LOSS_PERCENT = 0.02  # 2%
+TAKE_PROFIT_PERCENT = 0.04  # 4%
+MAX_DAILY_LOSS = 200  # USD
 
-positions = {}  # Keep track of open positions
+POSITIONS = {}  # symbol -> {'qty': int, 'entry_price': float}
+DAILY_PNL = 0
 
-
-# ------------------------------
-# Trading functions
-# ------------------------------
-async def place_order(symbol, side, qty, order_type=OrderType.MARKET):
+# -------------------------
+# Utilities
+# -------------------------
+async def submit_order(symbol: str, qty: int, side: OrderSide):
     try:
-        order_data = MarketOrderRequest(symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.DAY)
-        order = client.submit_order(order_data)
-        logger.info(f"Order submitted: {symbol} {side} {qty}")
-        return order
+        order = MarketOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=side,
+            time_in_force=TimeInForce.DAY
+        )
+        result = trading_client.submit_order(order)
+        logger.info(f"Order submitted: {side.value} {qty} {symbol}")
+        return result
     except Exception as e:
-        logger.error(f"Failed to submit order for {symbol}: {e}")
-        return None
+        logger.error(f"Order failed for {symbol}: {e}")
 
+def calculate_stop_take(entry_price: float):
+    stop = entry_price * (1 - STOP_LOSS_PERCENT)
+    take = entry_price * (1 + TAKE_PROFIT_PERCENT)
+    return stop, take
 
-async def handle_tick(data):
-    symbol = data.symbol
-    price = data.last
-    logger.info(f"{symbol} tick: {price}")
+# -------------------------
+# Trading Logic
+# -------------------------
+async def strategy(symbol: str, price: float):
+    global DAILY_PNL
 
-    # Check if we have a position
-    pos = positions.get(symbol)
+    # Skip if max daily loss reached
+    if DAILY_PNL <= -MAX_DAILY_LOSS:
+        logger.warning(f"Max daily loss reached. Skipping trades.")
+        return
 
-    if not pos:
-        # Example buy logic: just buy 1 lot
-        await place_order(symbol, OrderSide.BUY, MAX_LOTS_PER_TRADE)
-        positions[symbol] = {"buy_price": price, "qty": MAX_LOTS_PER_TRADE}
+    pos = POSITIONS.get(symbol)
+    if pos is None:
+        # Example: simple breakout buy
+        if price < 100:  # demo entry condition
+            order = await submit_order(symbol, TRADE_SIZE, OrderSide.BUY)
+            POSITIONS[symbol] = {'qty': TRADE_SIZE, 'entry_price': price}
+            logger.info(f"Entered {symbol} at {price}")
     else:
-        buy_price = pos["buy_price"]
-        # Stop loss
-        if price <= buy_price * (1 - STOP_LOSS_PCT):
-            await place_order(symbol, OrderSide.SELL, pos["qty"])
-            logger.info(f"{symbol} STOP LOSS hit! Selling {pos['qty']}")
-            positions.pop(symbol)
-        # Take profit
-        elif price >= buy_price * (1 + TAKE_PROFIT_PCT):
-            await place_order(symbol, OrderSide.SELL, pos["qty"])
-            logger.info(f"{symbol} TAKE PROFIT hit! Selling {pos['qty']}")
-            positions.pop(symbol)
+        stop, take = calculate_stop_take(pos['entry_price'])
+        if price <= stop or price >= take:
+            side = OrderSide.SELL
+            await submit_order(symbol, pos['qty'], side)
+            pnl = (price - pos['entry_price']) * pos['qty']
+            DAILY_PNL += pnl
+            logger.info(f"Exited {symbol} at {price}, P&L: {pnl}")
+            POSITIONS.pop(symbol)
 
+# -------------------------
+# Stream Handlers
+# -------------------------
+async def handle_quote(symbol, data):
+    price = data.bid_price
+    if price:
+        await strategy(symbol, price)
 
-# ------------------------------
-# Run Bot
-# ------------------------------
+async def handle_trade_update(data):
+    logger.info(f"Trade update: {data}")
+
+# -------------------------
+# Main Async Runner
+# -------------------------
 async def main():
-    # Subscribe to live trades
     for symbol in SYMBOLS:
-        stream.subscribe_trades(handle_tick, symbol)
-    await stream.run()
+        stream.subscribe_trades(handle_trade_update, symbol)
+        stream.subscribe_quotes(lambda data, sym=symbol: asyncio.create_task(handle_quote(sym, data)), symbol)
 
+    await stream._run_forever()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
