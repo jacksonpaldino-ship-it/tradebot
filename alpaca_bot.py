@@ -1,18 +1,14 @@
 import os
 import asyncio
 import logging
-from datetime import datetime
 from alpaca.data.live import StockDataStream
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
-from dotenv import load_dotenv
 
 # -----------------------
 # Load environment secrets
 # -----------------------
-load_dotenv()
-
 API_KEY = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 BASE_URL = os.getenv("ALPACA_BASE_URL")
@@ -32,11 +28,11 @@ logger = logging.getLogger("AlpacaPaperBot")
 # -----------------------
 # Configuration
 # -----------------------
-SYMBOLS = ["AAPL", "MSFT", "TSLA"]  # Example symbols, change as needed
-MAX_POSITIONS = 3                   # Max simultaneous positions
-CAPITAL_PER_TRADE = 1000           # USD per trade
-STOP_LOSS_PCT = 0.98               # 2% stop loss
-TAKE_PROFIT_PCT = 1.02             # 2% take profit
+SYMBOLS = ["AAPL", "MSFT", "TSLA"]  # Change to whatever you want
+MAX_POSITIONS = 3
+CAPITAL_PER_TRADE = 1000
+STOP_LOSS_PCT = 0.98
+TAKE_PROFIT_PCT = 1.02
 
 # -----------------------
 # Alpaca Clients
@@ -53,7 +49,6 @@ positions = {}  # symbol -> {"entry_price": float, "size": int}
 # Helper Functions
 # -----------------------
 async def place_order(symbol: str, qty: int, side: str):
-    """Place a market order."""
     try:
         order_request = MarketOrderRequest(
             symbol=symbol,
@@ -70,23 +65,18 @@ async def place_order(symbol: str, qty: int, side: str):
         return None
 
 def calculate_qty(price: float) -> int:
-    """Calculate shares to buy based on capital per trade."""
-    qty = int(CAPITAL_PER_TRADE / price)
-    return max(qty, 1)
+    return max(int(CAPITAL_PER_TRADE / price), 1)
 
 # -----------------------
 # Strategy Example
 # -----------------------
 async def simple_momentum_strategy(data):
-    """Simple momentum strategy example: buy if price increased from last tick."""
     symbol = data.symbol
     price = float(data.price)
 
-    # Skip if already in max positions
     if len(positions) >= MAX_POSITIONS:
         return
 
-    # Buy if not in position
     if symbol not in positions:
         qty = calculate_qty(price)
         order = await place_order(symbol, qty, "BUY")
@@ -94,18 +84,14 @@ async def simple_momentum_strategy(data):
             positions[symbol] = {"entry_price": price, "size": qty}
             logger.info(f"Entered position {symbol} at {price}")
 
-    # Check stop loss / take profit
     if symbol in positions:
         entry_price = positions[symbol]["entry_price"]
         size = positions[symbol]["size"]
 
-        # Stop loss
         if price <= entry_price * STOP_LOSS_PCT:
             await place_order(symbol, size, "SELL")
             logger.info(f"STOP LOSS triggered for {symbol} at {price}")
             del positions[symbol]
-
-        # Take profit
         elif price >= entry_price * TAKE_PROFIT_PCT:
             await place_order(symbol, size, "SELL")
             logger.info(f"TAKE PROFIT triggered for {symbol} at {price}")
@@ -121,12 +107,10 @@ async def on_trade(data):
 # Main
 # -----------------------
 async def main():
-    # Subscribe to trades
     for symbol in SYMBOLS:
         stream.subscribe_trades(on_trade, symbol)
     logger.info(f"Subscribed to symbols: {SYMBOLS}")
 
-    # Run the stream
     await stream._run_forever()
 
 if __name__ == "__main__":
