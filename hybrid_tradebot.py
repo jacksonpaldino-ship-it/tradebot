@@ -1,189 +1,155 @@
+import asyncio
+import datetime
+import logging
 import os
+import sys
+import json
 import time
-import pytz
-from datetime import datetime, timedelta
+import random
+from itertools import islice
+from zoneinfo import ZoneInfo
+from dotenv import load_dotenv
 
-from alpaca_trade_api import REST, TimeFrame
+import alpaca_trade_api as tradeapi
 
-# =============================
-# ENV / API SETUP (FIXED)
-# =============================
-API_KEY = os.environ["ALPACA_API_KEY"]
-API_SECRET = os.environ["ALPACA_SECRET_KEY"]
-BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+# ----------------------
+# Broker Abstraction
+# ----------------------
+class BrokerInterface:
+    """Abstraction layer to swap broker easily later."""
+    def __init__(self, api_key, secret_key, base_url):
+        self.api = tradeapi.REST(api_key, secret_key, base_url)
+        self.account = self.api.get_account()
 
-api = REST(API_KEY, API_SECRET, BASE_URL, api_version="v2")
+    # Market data
+    async def get_last_price(self, symbol):
+        barset = self.api.get_barset(symbol, 'minute', limit=1)
+        return barset[symbol][0].c if barset[symbol] else None
 
-NY = pytz.timezone("America/New_York")
-
-# =============================
-# CONFIG (SCALE SAFE)
-# =============================
-ACCOUNT_SIZE = 100_000       # change to 2_000 later
-RISK_PER_TRADE_PCT = 0.002   # 0.2%
-TAKE_PROFIT_PCT = 0.004      # 0.4%
-TRAIL_AFTER_PCT = 0.003
-TRAIL_GIVEBACK_PCT = 0.0015
-
-MAX_POSITIONS = 2
-SYMBOLS = ["XLF", "XLE", "XLV"]
-
-# =============================
-# TIME HELPERS
-# =============================
-def now_ny():
-    return datetime.now(NY)
-
-def market_close_soon():
-    t = now_ny()
-    close = t.replace(hour=16, minute=0, second=0)
-    return close - timedelta(minutes=5) <= t <= close
-
-def market_open():
-    clock = api.get_clock()
-    return clock.is_open
-
-# =============================
-# POSITION / SAFETY
-# =============================
-def flatten_all():
-    positions = api.list_positions()
-    for p in positions:
-        qty = abs(int(p.qty))
-        side = "sell" if p.side == "long" else "buy"
-        api.submit_order(
-            symbol=p.symbol,
-            qty=qty,
-            side=side,
-            type="market",
-            time_in_force="day"
-        )
-        print(f"FORCE FLATTEN {p.symbol}")
-
-def manage_positions():
-    positions = api.list_positions()
-
-    for p in positions:
-        qty = abs(int(p.qty))
-        entry = float(p.avg_entry_price)
-        current = float(p.current_price)
-
-        pnl_pct = (
-            (current - entry) / entry
-            if p.side == "long"
-            else (entry - current) / entry
-        )
-
-        # HARD TAKE PROFIT
-        if pnl_pct >= TAKE_PROFIT_PCT:
-            api.submit_order(
-                symbol=p.symbol,
-                qty=qty,
-                side="sell" if p.side == "long" else "buy",
-                type="market",
-                time_in_force="day"
-            )
-            print(f"TAKE PROFIT {p.symbol} {pnl_pct:.2%}")
-            continue
-
-        # TRAILING STOP
-        if pnl_pct >= TRAIL_AFTER_PCT:
-            trail_price = (
-                current * (1 - TRAIL_GIVEBACK_PCT)
-                if p.side == "long"
-                else current * (1 + TRAIL_GIVEBACK_PCT)
-            )
-
-            api.submit_order(
-                symbol=p.symbol,
-                qty=qty,
-                side="sell" if p.side == "long" else "buy",
-                type="trailing_stop",
-                trail_price=round(trail_price, 2),
-                time_in_force="day"
-            )
-            print(f"TRAIL SET {p.symbol}")
-
-# =============================
-# HIGH-FREQ-FIRST ENTRY LOGIC
-# =============================
-def entry_signal(symbol):
-    bars = api.get_bars(symbol, TimeFrame.Minute, limit=20).df
-    if len(bars) < 20:
-        return None
-
-    last = bars.iloc[-1]
-    prev = bars.iloc[-2]
-
-    # HIGH-FREQ FIRST: momentum impulse
-    if last.close > prev.high * 1.001:
-        return "long"
-
-    if last.close < prev.low * 0.999:
-        return "short"
-
-    return None
-
-def position_size(price):
-    dollar_risk = ACCOUNT_SIZE * RISK_PER_TRADE_PCT
-    return max(1, int(dollar_risk / price))
-
-def open_positions_count():
-    return len(api.list_positions())
-
-# =============================
-# MAIN LOOP
-# =============================
-def run():
-    print("BOT START")
-
-    while True:
+    # Place order
+    async def place_order(self, symbol, qty, side, type='market', time_in_force='day'):
         try:
-            if not market_open():
-                print("Market closed")
-                time.sleep(60)
-                continue
-
-            # HARD FLATTEN BEFORE CLOSE
-            if market_close_soon():
-                print("Near close — flattening")
-                flatten_all()
-                time.sleep(300)
-                continue
-
-            manage_positions()
-
-            if open_positions_count() >= MAX_POSITIONS:
-                time.sleep(30)
-                continue
-
-            for symbol in SYMBOLS:
-                if open_positions_count() >= MAX_POSITIONS:
-                    break
-
-                signal = entry_signal(symbol)
-                if not signal:
-                    continue
-
-                price = float(api.get_last_trade(symbol).price)
-                qty = position_size(price)
-
-                api.submit_order(
-                    symbol=symbol,
-                    qty=qty,
-                    side="buy" if signal == "long" else "sell",
-                    type="market",
-                    time_in_force="day"
-                )
-
-                print(f"ENTER {signal.upper()} {symbol} qty={qty}")
-                time.sleep(2)
-
-            time.sleep(15)
-
+            order = self.api.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side=side,
+                type=type,
+                time_in_force=time_in_force
+            )
+            return order, True
         except Exception as e:
-            print("ERROR:", e)
-            time.sleep(30)
+            return str(e), False
+
+    # Get positions
+    async def get_positions(self):
+        return self.api.list_positions()
+
+    # Cancel order
+    async def cancel_order(self, order_id):
+        return self.api.cancel_order(order_id)
+
+# ----------------------
+# Trading Bot
+# ----------------------
+class TradingBot:
+    def __init__(self, broker: BrokerInterface, symbols, logger):
+        self.broker = broker
+        self.symbols = symbols
+        self.logger = logger
+
+        # Async locks
+        self.locks = {s: asyncio.Lock() for s in symbols}
+
+        # Data structures
+        self.position_info = {}
+        self.on_going_orders = {s: [] for s in symbols}
+        self.on_going_orders_details = {}
+        self.active_symbols = []
+        self.max_price_seen = {s: 0 for s in symbols}
+        self.past_prices_seen = {s: [] for s in symbols}
+        self.average_price = {s: 0 for s in symbols}
+        self.fund_available = 100_000  # adjustable
+
+    # ----------------------
+    # Core async loop
+    # ----------------------
+    async def run(self):
+        self.logger.info("Bot started ...")
+        await asyncio.gather(
+            self.market_data_loop(),
+            self.position_sizing_loop(),
+            self.order_status_loop(),
+            self.position_closure_loop()
+        )
+
+    # ----------------------
+    # Market Data Processing
+    # ----------------------
+    async def market_data_loop(self):
+        while True:
+            for symbol in self.symbols:
+                price = await self.broker.get_last_price(symbol)
+                if price:
+                    self.max_price_seen[symbol] = max(self.max_price_seen[symbol], price)
+                    self.past_prices_seen[symbol].append(price)
+                    if len(self.past_prices_seen[symbol]) > 20:
+                        self.past_prices_seen[symbol].pop(0)
+                    self.average_price[symbol] = sum(self.past_prices_seen[symbol]) / len(self.past_prices_seen[symbol])
+            await asyncio.sleep(1)
+
+    # ----------------------
+    # Position Sizing
+    # ----------------------
+    async def position_sizing_loop(self):
+        x = 3
+        y = 5
+        while len(self.active_symbols) < len(self.symbols):
+            to_add = (s for s in self.symbols if s not in self.active_symbols)
+            self.active_symbols.extend(islice(to_add, x))
+            await asyncio.sleep(y)
+
+    # ----------------------
+    # Order Status Updater
+    # ----------------------
+    async def order_status_loop(self):
+        while True:
+            # Dummy: placeholder for real order updates
+            await asyncio.sleep(5)
+
+    # ----------------------
+    # Position Closure
+    # ----------------------
+    async def position_closure_loop(self):
+        while True:
+            now_time = datetime.datetime.now(ZoneInfo("Asia/Taipei")).time()
+            for symbol, info in self.position_info.items():
+                if now_time >= datetime.time(13, 30):  # exit cutoff
+                    async with self.locks[symbol]:
+                        qty = info["size"]
+                        if qty > 0:
+                            order, success = await self.broker.place_order(symbol, qty, "sell")
+                            if success:
+                                self.logger.info(f"{symbol} exit order placed successfully")
+                                self.position_info.pop(symbol)
+            await asyncio.sleep(1)
+
+# ----------------------
+# Supervisor
+# ----------------------
+def main():
+    load_dotenv()
+    api_key = os.getenv("ALPACA_API_KEY")
+    secret_key = os.getenv("ALPACA_SECRET_KEY")
+    base_url = os.getenv("ALPACA_BASE_URL")
+
+    logger = logging.getLogger("TradingBot")
+    logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
+
+    broker = BrokerInterface(api_key, secret_key, base_url)
+    symbols = ["AAPL", "TSLA", "MSFT"]  # example
+
+    bot = TradingBot(broker, symbols, logger)
+    asyncio.run(bot.run())
 
 if __name__ == "__main__":
-    run()
+    main()
