@@ -2,89 +2,77 @@ import os
 import asyncio
 import logging
 from datetime import datetime
+import pandas as pd
+
 from alpaca.data.live import StockDataStream
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
+from alpaca.trading.enums import OrderSide, TimeInForce
 
-# Logging
+# ------------------- CONFIGURATION -------------------
+API_KEY = os.getenv("ALPACA_API_KEY")
+SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+BASE_URL = os.getenv("ALPACA_BASE_URL")
+
+# Symbols to track
+SYMBOLS = ["AAPL", "TSLA", "MSFT"]
+
+# Paper trading quantity
+TRADE_QTY = 1
+
+# Logging setup
 logging.basicConfig(
+    filename="alpaca_bot.log",
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-# Load secrets from environment variables (GitHub Secrets)
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")  # default to paper
-
-if not all([ALPACA_API_KEY, ALPACA_SECRET_KEY]):
-    raise ValueError("Missing Alpaca API keys in environment variables")
-
-# Initialize Alpaca Trading Client (Paper trading)
-trading_client = TradingClient(
-    ALPACA_API_KEY,
-    ALPACA_SECRET_KEY,
-    paper=True  # explicitly paper trading
+    format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
-# Initialize Stock Data Stream
-stream = StockDataStream(ALPACA_API_KEY, ALPACA_SECRET_KEY, base_url=ALPACA_BASE_URL)
+# ------------------- VALIDATION -------------------
+if not API_KEY or not SECRET_KEY:
+    raise ValueError("Missing Alpaca API keys. Set them in your GitHub secrets.")
 
-# Symbols to trade
-SYMBOLS = ["AAPL", "TSLA", "MSFT"]  # Add your watchlist
-POSITION_LIMIT = 100  # max shares per order
+# ------------------- INITIALIZE CLIENTS -------------------
+trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
+stream = StockDataStream(api_key=API_KEY, secret_key=SECRET_KEY)
 
+# ------------------- HELPER FUNCTIONS -------------------
+def log_trade(action, symbol, qty, price):
+    logging.info(f"{action} | {symbol} | Qty: {qty} | Price: {price}")
 
-async def trade_on_tick(symbol: str, price: float):
-    """Simple example: buy 100 shares if price drops more than 1% from previous close"""
+async def handle_bars(bar):
+    """
+    Callback for streaming bars.
+    Example logic: logs bar and can place a simple paper market order.
+    """
+    print(f"{bar.symbol} | Open: {bar.open} High: {bar.high} Low: {bar.low} Close: {bar.close}")
+    logging.info(f"{bar.symbol} | Open: {bar.open} High: {bar.high} Low: {bar.low} Close: {bar.close}")
+
+    # Example trade logic: buy if close > open
     try:
-        # Fetch last closing price
-        barset = trading_client.get_bars(symbol, "1D", limit=2)
-        prev_close = barset[-2].c if len(barset) > 1 else barset[-1].c
-
-        change_pct = 100 * (price - prev_close) / prev_close
-        logger.info(f"{symbol} price {price}, change {change_pct:.2f}%")
-
-        # Example strategy: buy if price dropped > 1%
-        if change_pct <= -1.0:
-            logger.info(f"{symbol} condition met: buying {POSITION_LIMIT} shares")
-            order_request = MarketOrderRequest(
-                symbol=symbol,
-                qty=POSITION_LIMIT,
+        if bar.close > bar.open:
+            order_data = MarketOrderRequest(
+                symbol=bar.symbol,
+                qty=TRADE_QTY,
                 side=OrderSide.BUY,
-                type=OrderType.MARKET,
                 time_in_force=TimeInForce.DAY
             )
-            resp = trading_client.submit_order(order_request)
-            logger.info(f"Order submitted: {resp}")
-        else:
-            logger.debug(f"{symbol} condition not met")
+            order = trading_client.submit_order(order_data)
+            log_trade("BUY", bar.symbol, TRADE_QTY, bar.close)
     except Exception as e:
-        logger.error(f"Error in trade_on_tick for {symbol}: {e}")
+        logging.error(f"Error submitting order for {bar.symbol}: {e}")
 
+# ------------------- SUBSCRIBE TO SYMBOLS -------------------
+for symbol in SYMBOLS:
+    stream.subscribe_bars(handle_bars, symbol)
 
-# Callback for new trade updates
-async def handle_trade_update(data):
-    symbol = data.symbol
-    price = data.price
-    await trade_on_tick(symbol, price)
-
-
+# ------------------- RUN STREAM -------------------
 async def main():
-    # Subscribe to trades
-    for symbol in SYMBOLS:
-        stream.subscribe_trades(handle_trade_update, symbol)
-
-    logger.info("Starting Alpaca streaming...")
-    await stream._run_forever()
-
+    while True:
+        try:
+            await stream.run()
+        except Exception as e:
+            logging.error(f"Stream error: {e}. Reconnecting in 5 seconds...")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped manually")
-    except Exception as e:
-        logger.error(f"Bot crashed: {e}")
+    asyncio.run(main())
