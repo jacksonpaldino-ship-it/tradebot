@@ -1,6 +1,5 @@
-alpaca-trade-api
-yfinance
-pandas
-numpy
-requests
+alpaca-trade-api==3.0.0
 pytz
+asyncio
+pandas
+python-dotenv
