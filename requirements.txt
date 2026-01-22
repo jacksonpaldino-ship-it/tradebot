@@ -1,19 +1,13 @@
-# Alpaca API that exists
 alpaca-trade-api==3.2.0
-
-# Core dependencies
 pandas==2.1.1
-numpy==1.26.5
+numpy==2.4.1
 python-dotenv==1.2.1
 pytz==2025.2
-
-# Web & async (must match Alpaca API)
 aiohttp==3.8.1
 websockets==10.4
 websocket-client==1.9.0
-
-# Utilities
 PyYAML==6.0
 deprecation==2.1.0
 requests==2.32.5
 urllib3==1.26.20
+msgpack==1.0.3
