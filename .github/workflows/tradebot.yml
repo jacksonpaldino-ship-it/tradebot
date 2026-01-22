@@ -2,30 +2,45 @@ name: Daily Trade Bot
 
 on:
   schedule:
-    - cron: '0 13 * * 1-5'  # Runs at 8AM EST (13 UTC) on weekdays
-  workflow_dispatch:
+    - cron: '0 14 * * 1-5'  # Runs at 14:00 UTC (9:00 AM EST) Mon-Fri
+  workflow_dispatch:  # Allows manual run
 
 jobs:
-  run-trade-bot:
+  run-bot:
     runs-on: ubuntu-latest
-
     steps:
+      # 1️⃣ Checkout your repo
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      # 2️⃣ Set up Python
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v4
         with:
           python-version: 3.11
 
+      # 3️⃣ Upgrade pip, setuptools, wheel
+      - name: Upgrade pip, setuptools, wheel
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+
+      # 4️⃣ Install dependencies
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install --no-cache-dir -r requirements.txt
+          python -m pip install --no-cache-dir -r requirements.txt
 
-      - name: Run Trade Bot
+      # 5️⃣ Run the bot
+      - name: Run Alpaca Bot
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          PAPER_TRADING: true  # set to false if you want live trading
         run: |
-          python main.py
+          python main.py  # replace with your bot entry script
+
+      # 6️⃣ Optional: Save logs
+      - name: Save logs
+        uses: actions/upload-artifact@v3
+        with:
+          name: tradebot-logs
+          path: logs/*.log  # adjust path if your bot writes logs somewhere else
