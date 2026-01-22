@@ -1,14 +1,14 @@
-# Alpaca API compatible with Python 3.11
-alpaca-trade-api==4.1.0
+# Alpaca API that exists
+alpaca-trade-api==3.2.0
 
 # Core dependencies
-pandas==3.0.0
-numpy==2.4.1
+pandas==2.1.1
+numpy==1.26.5
 python-dotenv==1.2.1
 pytz==2025.2
 
-# Web & async
-aiohttp==3.8.5
+# Web & async (must match Alpaca API)
+aiohttp==3.8.1
 websockets==10.4
 websocket-client==1.9.0
 
