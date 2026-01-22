@@ -7,13 +7,11 @@ from alpaca.data.live import StockDataStream
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
-from dotenv import load_dotenv
 
-# Load secrets from .env (or GitHub secrets in Actions)
-load_dotenv()
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+# Load secrets from environment (GitHub Actions secrets)
+ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
+ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
 if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
     raise ValueError("Missing Alpaca API keys in secrets!")
@@ -56,7 +54,7 @@ async def handle_bars(bar):
     logger.info(f"New bar: {bar}")
     print(f"{datetime.now()} - New bar: {bar}")
 
-    # Simple example strategy: Buy if price increased from previous bar
+    # Simple example strategy: Buy if price increased, sell if decreased
     if bar.close > bar.open:
         order_data = MarketOrderRequest(
             symbol=SYMBOL,
@@ -87,7 +85,7 @@ async def handle_bars(bar):
     if bars_seen >= MAX_BARS:
         await stream.stop_stream()
 
-# Add the handler
+# Subscribe to bars
 stream.subscribe_bars(handle_bars, SYMBOL)
 
 async def main():
