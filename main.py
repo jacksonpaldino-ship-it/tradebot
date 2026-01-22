@@ -7,8 +7,10 @@ from alpaca.data.live import StockDataStream
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
+from dotenv import load_dotenv
 
-# Use GitHub secrets directly
+# Load secrets from environment variables
+load_dotenv()
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
@@ -24,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger()
 
-# Trading client
+# Trading client (paper trading)
 trading_client = TradingClient(
     ALPACA_API_KEY,
     ALPACA_SECRET_KEY,
@@ -38,18 +40,23 @@ stream = StockDataStream(
 )
 
 # Strategy settings
-SYMBOL = "AAPL"
-POSITION_SIZE = 1
-MAX_BARS = 10
+SYMBOL = "AAPL"  # Example symbol
+POSITION_SIZE = 1  # shares per trade
+MAX_BARS = 10  # Stop after X bars for testing
 bars_seen = 0
+
+# P&L tracking
 pnl = 0.0
 
 async def handle_bars(bar):
     global bars_seen, pnl
     bars_seen += 1
+
+    # Log bar info
     logger.info(f"New bar: {bar}")
     print(f"{datetime.now()} - New bar: {bar}")
 
+    # Simple example strategy: Buy if price increased from previous bar
     if bar.close > bar.open:
         order_data = MarketOrderRequest(
             symbol=SYMBOL,
@@ -76,15 +83,17 @@ async def handle_bars(bar):
     logger.info(f"Current P&L: {pnl}")
     print(f"Current P&L: {pnl}")
 
+    # Stop after max bars
     if bars_seen >= MAX_BARS:
         await stream.stop_stream()
 
+# Add the handler
 stream.subscribe_bars(handle_bars, SYMBOL)
 
 async def main():
     logger.info("Starting Alpaca bot...")
     print("Starting Alpaca bot...")
-    await stream._run_forever()
+    await stream._run_forever()  # Properly awaited
 
 if __name__ == "__main__":
     asyncio.run(main())
