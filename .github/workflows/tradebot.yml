@@ -1,12 +1,12 @@
-name: Run Alpaca Trading Bot
+name: Daily Trade Bot
 
 on:
-  workflow_dispatch:       # Can be triggered manually
+  workflow_dispatch:
   schedule:
-    - cron: '0 13 * * 1-5'  # Runs at 13:00 UTC Mon-Fri (market hours)
+    - cron: '0 14 * * 1-5'  # Runs every weekday at 14:00 UTC (9:00 EST)
 
 jobs:
-  run-bot:
+  run-tradebot:
     runs-on: ubuntu-latest
 
     env:
@@ -19,15 +19,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-
-      - name: Upgrade pip
-        run: python -m pip install --upgrade pip
+          python-version: 3.11
 
       - name: Install dependencies
-        run: python -m pip install --no-cache-dir -r requirements.txt
+        run: python -m pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
       - name: Run Alpaca Bot
         run: python main.py
