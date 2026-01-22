@@ -2,13 +2,12 @@ name: Daily Trade Bot
 
 on:
   schedule:
-    - cron: '0 14 * * 1-5'  # Runs every weekday at 14:00 UTC
-  workflow_dispatch:       # Allows manual runs
+    - cron: '0 14 * * 1-5'
+  workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v3
