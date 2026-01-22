@@ -2,67 +2,98 @@ import os
 import asyncio
 import logging
 from datetime import datetime
-
+import pandas as pd
 from alpaca.data.live import StockDataStream
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
+from dotenv import load_dotenv
 
-# ------------------- CONFIGURATION -------------------
-API_KEY = os.getenv("ALPACA_API_KEY")
-SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-BASE_URL = os.getenv("ALPACA_BASE_URL")  # Not needed for StockDataStream in alpaca-py
+# Load secrets from .env (or GitHub secrets in Actions)
+load_dotenv()
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
-SYMBOLS = ["AAPL", "TSLA", "MSFT"]
-TRADE_QTY = 1
+if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+    raise ValueError("Missing Alpaca API keys in secrets!")
 
+# Logging setup
 logging.basicConfig(
     filename="alpaca_bot.log",
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger()
+
+# Trading client (paper trading)
+trading_client = TradingClient(
+    ALPACA_API_KEY,
+    ALPACA_SECRET_KEY,
+    paper=True
 )
 
-# ------------------- VALIDATION -------------------
-if not API_KEY or not SECRET_KEY:
-    raise ValueError("Missing Alpaca API keys in secrets.")
+# Stock stream
+stream = StockDataStream(
+    ALPACA_API_KEY,
+    ALPACA_SECRET_KEY
+)
 
-# ------------------- INITIALIZE CLIENTS -------------------
-trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
-stream = StockDataStream(api_key=API_KEY, secret_key=SECRET_KEY)
+# Strategy settings
+SYMBOL = "AAPL"  # Example symbol
+POSITION_SIZE = 1  # shares per trade
+MAX_BARS = 10  # Stop after X bars for testing
+bars_seen = 0
 
-# ------------------- HELPER FUNCTIONS -------------------
-def log_trade(action, symbol, qty, price):
-    logging.info(f"{action} | {symbol} | Qty: {qty} | Price: {price}")
+# P&L tracking
+pnl = 0.0
 
 async def handle_bars(bar):
-    print(f"{bar.symbol} | Open: {bar.open} High: {bar.high} Low: {bar.low} Close: {bar.close}")
-    logging.info(f"{bar.symbol} | Open: {bar.open} High: {bar.high} Low: {bar.low} Close: {bar.close}")
+    global bars_seen, pnl
+    bars_seen += 1
 
-    try:
-        if bar.close > bar.open:
-            order_data = MarketOrderRequest(
-                symbol=bar.symbol,
-                qty=TRADE_QTY,
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY
-            )
-            order = trading_client.submit_order(order_data)
-            log_trade("BUY", bar.symbol, TRADE_QTY, bar.close)
-    except Exception as e:
-        logging.error(f"Error submitting order for {bar.symbol}: {e}")
+    # Log bar info
+    logger.info(f"New bar: {bar}")
+    print(f"{datetime.now()} - New bar: {bar}")
 
-# ------------------- SUBSCRIBE TO SYMBOLS -------------------
-for symbol in SYMBOLS:
-    stream.subscribe_bars(handle_bars, symbol)
+    # Simple example strategy: Buy if price increased from previous bar
+    if bar.close > bar.open:
+        order_data = MarketOrderRequest(
+            symbol=SYMBOL,
+            qty=POSITION_SIZE,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY
+        )
+        order = trading_client.submit_order(order_data)
+        logger.info(f"Submitted BUY order: {order}")
+        print(f"BUY order submitted: {order}")
+        pnl -= bar.close * POSITION_SIZE
+    elif bar.close < bar.open:
+        order_data = MarketOrderRequest(
+            symbol=SYMBOL,
+            qty=POSITION_SIZE,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY
+        )
+        order = trading_client.submit_order(order_data)
+        logger.info(f"Submitted SELL order: {order}")
+        print(f"SELL order submitted: {order}")
+        pnl += bar.close * POSITION_SIZE
 
-# ------------------- RUN STREAM WITH RECONNECT -------------------
-async def run_stream():
-    while True:
-        try:
-            await stream._run_forever()  # Properly await the internal coroutine
-        except Exception as e:
-            logging.error(f"Stream error: {e}. Reconnecting in 5 seconds...")
-            await asyncio.sleep(5)  # wait before reconnecting
+    logger.info(f"Current P&L: {pnl}")
+    print(f"Current P&L: {pnl}")
+
+    # Stop after max bars
+    if bars_seen >= MAX_BARS:
+        await stream.stop_stream()
+
+# Add the handler
+stream.subscribe_bars(handle_bars, SYMBOL)
+
+async def main():
+    logger.info("Starting Alpaca bot...")
+    print("Starting Alpaca bot...")
+    await stream._run_forever()  # Properly awaited
 
 if __name__ == "__main__":
-    asyncio.run(run_stream())
+    asyncio.run(main())
