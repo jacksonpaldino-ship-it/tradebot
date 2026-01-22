@@ -1,9 +1,9 @@
-alpaca-trade-api==3.2.0
+alpaca-py==2.0.3
 pandas==2.1.1
-numpy==1.26.4
+numpy==2.4.1
 python-dotenv==1.2.1
 pytz==2025.2
-aiohttp==3.8.3
+aiohttp==3.8.5
 websockets==10.4
 websocket-client==1.9.0
 PyYAML==6.0.1
