@@ -1,31 +1,33 @@
-name: Run Alpaca Paper Bot
+name: Run Alpaca Bot
 
 on:
   schedule:
-    - cron: '0 13 * * 1-5' # Every weekday at 13:00 UTC
-  workflow_dispatch: # Manual trigger
+    - cron: "0 14 * * 1-5" # Runs at 14:00 UTC (9 AM EST) Mon-Fri
+  workflow_dispatch: # Allows manual run
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: 3.11
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install alpaca-py pytz pandas
+          pip install -r requirements.txt
+
+      - name: Create .env from GitHub secrets
+        run: |
+          echo "ALPACA_API_KEY_ID=${{ secrets.ALPACA_API_KEY }}" >> .env
+          echo "ALPACA_SECRET_KEY=${{ secrets.ALPACA_SECRET_KEY }}" >> .env
+          echo "APCA_API_BASE_URL=${{ secrets.ALPACA_BASE_URL }}" >> .env
 
       - name: Run Alpaca Bot
-        env:
-          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
-          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-          ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
         run: python alpaca_bot.py
