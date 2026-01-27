@@ -15,18 +15,20 @@ api = REST(API_KEY, API_SECRET, BASE_URL, api_version="v2")
 TZ = pytz.timezone("America/New_York")
 
 # ================== HELPERS ==================
-def get_equity_at(date_str):
+def get_equity_from_range(start_date, end_date):
     """
-    Returns equity at the END of the given date.
+    Returns equity at the START of the given range.
     """
     hist = api.get_portfolio_history(
-        date_start=date_str,
-        date_end=date_str,
+        date_start=start_date,
+        date_end=end_date,
         timeframe="1D"
     )
+
     if not hist.equity:
         return None
-    return hist.equity[-1]
+
+    return float(hist.equity[0])
 
 # ================== MAIN ==================
 def run():
@@ -38,7 +40,7 @@ def run():
 
     # ---------- DAILY ----------
     yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-    equity_yesterday = get_equity_at(yesterday)
+    equity_yesterday = get_equity_from_range(yesterday, today)
     daily_pnl = (
         current_equity - equity_yesterday
         if equity_yesterday is not None
@@ -47,7 +49,7 @@ def run():
 
     # ---------- WEEKLY ----------
     week_start = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
-    equity_week_start = get_equity_at(week_start)
+    equity_week_start = get_equity_from_range(week_start, today)
     weekly_pnl = (
         current_equity - equity_week_start
         if equity_week_start is not None
@@ -56,7 +58,7 @@ def run():
 
     # ---------- MONTHLY ----------
     month_start = now.replace(day=1).strftime("%Y-%m-%d")
-    equity_month_start = get_equity_at(month_start)
+    equity_month_start = get_equity_from_range(month_start, today)
     monthly_pnl = (
         current_equity - equity_month_start
         if equity_month_start is not None
@@ -79,7 +81,7 @@ def run():
         for p in positions:
             print(
                 f"{p.symbol} | Qty: {p.qty} | "
-                f"P/L: ${float(p.unrealized_pl):,.2f}"
+                f"Unrealized P/L: ${float(p.unrealized_pl):,.2f}"
             )
     else:
         print("No open positions")
