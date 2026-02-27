@@ -1,83 +1,77 @@
 import os
 import asyncio
-import logging
-from datetime import time
-from dotenv import load_dotenv
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
-from alpaca.data.live import StockDataStream
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
-from alpaca.trading.requests import StopLossRequest, TakeProfitRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.data.live import StockDataStream
 
-# ===== SETTINGS =====
+# ===== CONFIG =====
 SYMBOL = "AAPL"
-
-RISK_PER_TRADE = 0.015      # 1.5% risk
-RISK_REWARD = 2.5           # Bigger profit target
-MAX_DAILY_LOSS = 0.03       # 3% max loss
 ORB_MINUTES = 5
-EOD_CUTOFF = time(15, 55)
-# ====================
+RISK_PER_TRADE = 0.01          # 1% account risk
+RR_RATIO = 2                   # 2R target
+MAX_DAILY_LOSS = 0.02          # 2% daily stop
+EOD_LIQUIDATION_TIME = time(15, 55)
 
-load_dotenv()
-API_KEY = os.getenv("ALPACA_API_KEY")
-API_SECRET = os.getenv("ALPACA_SECRET_KEY")
+# ===== SETUP =====
+api_key = os.environ["ALPACA_API_KEY"]
+secret_key = os.environ["ALPACA_SECRET_KEY"]
 
-trading_client = TradingClient(API_KEY, API_SECRET, paper=True)
-stream = StockDataStream(API_KEY, API_SECRET)
+trading_client = TradingClient(api_key, secret_key, paper=True)
+data_stream = StockDataStream(api_key, secret_key)
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger()
+ny_tz = ZoneInfo("America/New_York")
 
 opening_high = None
 opening_low = None
 orb_complete = False
-traded_today = False
-start_equity = None
+daily_loss_hit = False
+
+# ===== HELPERS =====
+
+def get_account_equity():
+    account = trading_client.get_account()
+    return float(account.equity)
+
+def get_position():
+    try:
+        return trading_client.get_open_position(SYMBOL)
+    except:
+        return None
 
 def calculate_position_size(entry, stop):
-    account = trading_client.get_account()
-    equity = float(account.equity)
-
+    equity = get_account_equity()
     risk_amount = equity * RISK_PER_TRADE
-    stop_distance = abs(entry - stop)
+    per_share_risk = abs(entry - stop)
 
-    qty = int(risk_amount / stop_distance)
+    if per_share_risk == 0:
+        return 0
 
-    return max(qty, 1)
+    qty = int(risk_amount / per_share_risk)
+    return max(qty, 0)
 
-def flatten_all():
-    trading_client.close_all_positions()
+def close_all_positions():
+    trading_client.close_all_positions(cancel_orders=True)
+
+# ===== MAIN BAR HANDLER =====
 
 async def handle_bar(bar):
-    global opening_high, opening_low, orb_complete
-    global traded_today, start_equity
+    global opening_high, opening_low, orb_complete, daily_loss_hit
 
-    clock = trading_client.get_clock()
-    now = clock.timestamp.time()
+    now = datetime.now(ny_tz).time()
+    price = bar.close
 
-    if not clock.is_open or now >= EOD_CUTOFF:
-        flatten_all()
-        await stream.stop_stream()
+    # EOD liquidation
+    if now >= EOD_LIQUIDATION_TIME:
+        close_all_positions()
         return
 
-    account = trading_client.get_account()
-
-    if start_equity is None:
-        start_equity = float(account.equity)
-
-    if float(account.equity) <= start_equity * (1 - MAX_DAILY_LOSS):
-        log.info("Daily loss limit hit.")
-        flatten_all()
-        await stream.stop_stream()
-        return
-
-    # ===== Build Opening Range =====
-    market_open = time(9, 30)
-
+    # Build ORB
     if not orb_complete:
-        if now >= market_open and now < time(9, 30 + ORB_MINUTES):
+        if now >= time(9,30) and now < time(9,30 + ORB_MINUTES):
             if opening_high is None:
                 opening_high = bar.high
                 opening_low = bar.low
@@ -85,73 +79,55 @@ async def handle_bar(bar):
                 opening_high = max(opening_high, bar.high)
                 opening_low = min(opening_low, bar.low)
             return
-        else:
+        elif now >= time(9,30 + ORB_MINUTES):
             orb_complete = True
-            log.info(f"ORB High: {opening_high}, Low: {opening_low}")
+
+    # Guard
+    if opening_high is None or opening_low is None:
+        return
+
+    # Skip if already in position
+    if get_position() is not None:
+        return
+
+    # LONG breakout
+    if price > opening_high:
+        entry = price
+        stop = opening_low
+        target = entry + (entry - stop) * RR_RATIO
+
+        qty = calculate_position_size(entry, stop)
+        if qty <= 0:
             return
 
-    if traded_today:
-        return
-
-    price = bar.close
-
-    # ===== LONG BREAKOUT =====
-    if price > opening_high:
-        stop = opening_low
-        qty = calculate_position_size(price, stop)
-
-        trading_client.submit_order(
-            MarketOrderRequest(
-                symbol=SYMBOL,
-                qty=qty,
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY,
-                order_class=OrderClass.BRACKET,
-                take_profit=TakeProfitRequest(
-                    limit_price=price + (price - stop) * RISK_REWARD
-                ),
-                stop_loss=StopLossRequest(
-                    stop_price=stop
-                )
-            )
+        order = MarketOrderRequest(
+            symbol=SYMBOL,
+            qty=qty,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY
         )
+        trading_client.submit_order(order)
 
-        traded_today = True
-        log.info(f"LONG {qty} shares")
-
-    # ===== SHORT BREAKOUT =====
+    # SHORT breakout
     elif price < opening_low:
+        entry = price
         stop = opening_high
-        qty = calculate_position_size(price, stop)
+        target = entry - (stop - entry) * RR_RATIO
 
-        trading_client.submit_order(
-            MarketOrderRequest(
-                symbol=SYMBOL,
-                qty=qty,
-                side=OrderSide.SELL,
-                time_in_force=TimeInForce.DAY,
-                order_class=OrderClass.BRACKET,
-                take_profit=TakeProfitRequest(
-                    limit_price=price - (stop - price) * RISK_REWARD
-                ),
-                stop_loss=StopLossRequest(
-                    stop_price=stop
-                )
-            )
+        qty = calculate_position_size(entry, stop)
+        if qty <= 0:
+            return
+
+        order = MarketOrderRequest(
+            symbol=SYMBOL,
+            qty=qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY
         )
+        trading_client.submit_order(order)
 
-        traded_today = True
-        log.info(f"SHORT {qty} shares")
+# ===== RUN =====
 
-async def main():
-    clock = trading_client.get_clock()
-    if not clock.is_open:
-        print("Market closed.")
-        return
+data_stream.subscribe_bars(handle_bar, SYMBOL)
 
-    print("ORB Bot Running.")
-    stream.subscribe_bars(handle_bar, SYMBOL)
-    await stream._run_forever()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(data_stream._run_forever())
