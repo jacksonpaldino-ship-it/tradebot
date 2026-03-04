@@ -5,129 +5,198 @@ from zoneinfo import ZoneInfo
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.data.live import StockDataStream
 
 # ===== CONFIG =====
-SYMBOL = "AAPL"
-ORB_MINUTES = 5
-RISK_PER_TRADE = 0.01          # 1% account risk
-RR_RATIO = 2                   # 2R target
-MAX_DAILY_LOSS = 0.02          # 2% daily stop
-EOD_LIQUIDATION_TIME = time(15, 55)
+SYMBOLS = ["SPY", "QQQ", "NVDA", "TSLA", "AAPL"]
+ORB_BARS = 3
+RISK_PER_TRADE = 0.015
+RR_RATIO = 2
+MAX_TRADES_PER_DAY = 4
+DAILY_STOP_R = -3
+DAILY_TARGET_R = 4
+EOD_TIME = time(15, 55)
 
 # ===== SETUP =====
 api_key = os.environ["ALPACA_API_KEY"]
 secret_key = os.environ["ALPACA_SECRET_KEY"]
 
 trading_client = TradingClient(api_key, secret_key, paper=True)
-data_stream = StockDataStream(api_key, secret_key)
+stream = StockDataStream(api_key, secret_key)
 
-ny_tz = ZoneInfo("America/New_York")
+ny = ZoneInfo("America/New_York")
 
-opening_high = None
-opening_low = None
-orb_complete = False
-daily_loss_hit = False
+# ===== STATE =====
+state = {}
+daily_r = 0
+trades_today = 0
+current_day = None
+
+for symbol in SYMBOLS:
+    state[symbol] = {
+        "opening_high": None,
+        "opening_low": None,
+        "bar_count": 0,
+        "orb_complete": False,
+        "trades": 0
+    }
 
 # ===== HELPERS =====
 
-def get_account_equity():
-    account = trading_client.get_account()
-    return float(account.equity)
+def reset_day():
+    global daily_r, trades_today
+    daily_r = 0
+    trades_today = 0
+    for s in state:
+        state[s]["opening_high"] = None
+        state[s]["opening_low"] = None
+        state[s]["bar_count"] = 0
+        state[s]["orb_complete"] = False
+        state[s]["trades"] = 0
 
-def get_position():
+
+def get_equity():
+    return float(trading_client.get_account().equity)
+
+
+def get_position(symbol):
     try:
-        return trading_client.get_open_position(SYMBOL)
+        return trading_client.get_open_position(symbol)
     except:
         return None
 
-def calculate_position_size(entry, stop):
-    equity = get_account_equity()
+
+def calculate_qty(entry, stop):
+    equity = get_equity()
     risk_amount = equity * RISK_PER_TRADE
     per_share_risk = abs(entry - stop)
 
-    if per_share_risk == 0:
+    if per_share_risk <= 0:
         return 0
 
     qty = int(risk_amount / per_share_risk)
     return max(qty, 0)
 
-def close_all_positions():
+
+def close_all():
     trading_client.close_all_positions(cancel_orders=True)
 
-# ===== MAIN BAR HANDLER =====
+
+# ===== MAIN HANDLER =====
 
 async def handle_bar(bar):
-    global opening_high, opening_low, orb_complete, daily_loss_hit
+    global daily_r, trades_today, current_day
 
-    now = datetime.now(ny_tz).time()
+    now = datetime.now(ny)
+    today = now.date()
+    symbol = bar.symbol
     price = bar.close
 
-    # EOD liquidation
-    if now >= EOD_LIQUIDATION_TIME:
-        close_all_positions()
+    if current_day != today:
+        current_day = today
+        reset_day()
+
+    if now.time() >= EOD_TIME:
+        close_all()
         return
 
-    # Build ORB
-    if not orb_complete:
-        if now >= time(9,30) and now < time(9,30 + ORB_MINUTES):
-            if opening_high is None:
-                opening_high = bar.high
-                opening_low = bar.low
-            else:
-                opening_high = max(opening_high, bar.high)
-                opening_low = min(opening_low, bar.low)
-            return
-        elif now >= time(9,30 + ORB_MINUTES):
-            orb_complete = True
-
-    # Guard
-    if opening_high is None or opening_low is None:
+    if daily_r <= DAILY_STOP_R or daily_r >= DAILY_TARGET_R:
         return
 
-    # Skip if already in position
-    if get_position() is not None:
+    if trades_today >= MAX_TRADES_PER_DAY:
         return
 
-    # LONG breakout
-    if price > opening_high:
+    if bar.timestamp.astimezone(ny).time() < time(9, 30):
+        return
+
+    s = state[symbol]
+
+    # ===== BUILD ORB =====
+    if not s["orb_complete"]:
+        s["bar_count"] += 1
+
+        if s["opening_high"] is None:
+            s["opening_high"] = bar.high
+            s["opening_low"] = bar.low
+        else:
+            s["opening_high"] = max(s["opening_high"], bar.high)
+            s["opening_low"] = min(s["opening_low"], bar.low)
+
+        if s["bar_count"] >= ORB_BARS:
+            s["orb_complete"] = True
+            print(f"{symbol} ORB built")
+
+        return
+
+    if s["opening_high"] is None or s["opening_low"] is None:
+        return
+
+    if get_position(symbol) is not None:
+        return
+
+    if s["trades"] >= 2:
+        return
+
+    # ===== LONG =====
+    if price > s["opening_high"]:
+
         entry = price
-        stop = opening_low
+        stop = s["opening_low"]
         target = entry + (entry - stop) * RR_RATIO
 
-        qty = calculate_position_size(entry, stop)
-        if qty <= 0:
+        qty = calculate_qty(entry, stop)
+        if qty == 0:
             return
 
         order = MarketOrderRequest(
-            symbol=SYMBOL,
+            symbol=symbol,
             qty=qty,
             side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY
+            time_in_force=TimeInForce.DAY,
+            order_class=OrderClass.BRACKET,
+            stop_loss={"stop_price": stop},
+            take_profit={"limit_price": target},
         )
+
         trading_client.submit_order(order)
 
-    # SHORT breakout
-    elif price < opening_low:
+        trades_today += 1
+        s["trades"] += 1
+        daily_r -= 1
+        print(f"LONG {symbol} {qty}")
+
+    # ===== SHORT =====
+    elif price < s["opening_low"]:
+
         entry = price
-        stop = opening_high
+        stop = s["opening_high"]
         target = entry - (stop - entry) * RR_RATIO
 
-        qty = calculate_position_size(entry, stop)
-        if qty <= 0:
+        qty = calculate_qty(entry, stop)
+        if qty == 0:
             return
 
         order = MarketOrderRequest(
-            symbol=SYMBOL,
+            symbol=symbol,
             qty=qty,
             side=OrderSide.SELL,
-            time_in_force=TimeInForce.DAY
+            time_in_force=TimeInForce.DAY,
+            order_class=OrderClass.BRACKET,
+            stop_loss={"stop_price": stop},
+            take_profit={"limit_price": target},
         )
+
         trading_client.submit_order(order)
 
-# ===== RUN =====
+        trades_today += 1
+        s["trades"] += 1
+        daily_r -= 1
+        print(f"SHORT {symbol} {qty}")
 
-data_stream.subscribe_bars(handle_bar, SYMBOL)
 
-asyncio.run(data_stream._run_forever())
+# ===== SUBSCRIBE =====
+for symbol in SYMBOLS:
+    stream.subscribe_bars(handle_bar, symbol)
+
+asyncio.run(stream._run_forever())
