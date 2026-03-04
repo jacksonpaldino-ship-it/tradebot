@@ -1,0 +1,37 @@
+name: Daily Swing Bot
+
+on:
+  schedule:
+    # Runs at 4:10 PM New York time, Mon-Fri.
+    # 4:10 PM ET = 21:10 UTC during EST, 20:10 UTC during EDT.
+    # This schedule uses UTC; adjust if needed when DST changes.
+    - cron: "10 21 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --no-cache-dir -r requirements.txt
+
+      - name: Run bot
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          # Optional (defaults to paper base if not set)
+          ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
+        run: |
+          python main.py
