@@ -13,14 +13,14 @@ SYMBOLS = [
     "QQQ", "SPY"
 ]
 
-# Loosened strategy so it actually trades
-BREAKOUT_LOOKBACK_DAYS = 5
-SMA_EXIT_DAYS = 10
-MAX_HOLD_DAYS = 7
+# VERY LOOSE SETTINGS TO FORCE MORE TRADES
+SMA_ENTRY_DAYS = 3
+SMA_EXIT_DAYS = 3
+MAX_HOLD_DAYS = 5
 
 RISK_PER_TRADE = 0.01
-STOP_PCT = 0.04
-TAKE_PROFIT_PCT = 0.08
+STOP_PCT = 0.03
+TAKE_PROFIT_PCT = 0.06
 MAX_POSITIONS = 5
 MAX_NOTIONAL_PER_TRADE = 0.25
 
@@ -122,33 +122,44 @@ def submit_bracket_buy(symbol: str, qty: int, ref_price: float):
 
 # ================== STRATEGY ==================
 def should_enter_long(symbol: str, bars):
-    need = BREAKOUT_LOOKBACK_DAYS + 2
+    """
+    Very loose entry:
+    - enough bars
+    - price above yesterday close
+    - price above 3-day SMA
+    """
+    need = max(SMA_ENTRY_DAYS, 3) + 1
     if len(bars) < need:
-        return (False, None)
+        return (False, None, None)
 
-    last = bars[-1]
-    close = float(last.c)
-    if close < MIN_PRICE:
-        return (False, None)
+    closes = [float(b.c) for b in bars]
+    close_today = closes[-1]
+    close_yesterday = closes[-2]
+    entry_sma = sma(closes[-SMA_ENTRY_DAYS:])
 
-    prev_window = bars[-(BREAKOUT_LOOKBACK_DAYS + 1):-1]
-    highest_prev_high = max(float(b.h) for b in prev_window)
+    if close_today < MIN_PRICE:
+        return (False, None, None)
 
-    # Easier trigger: close above previous N-day high
-    if close > highest_prev_high:
-        return (True, close)
+    if entry_sma is None:
+        return (False, None, None)
 
-    return (False, None)
+    # strength score = daily percent move
+    strength = (close_today / close_yesterday) - 1.0
+
+    if close_today > close_yesterday and close_today > entry_sma:
+        return (True, close_today, strength)
+
+    return (False, None, None)
 
 def should_exit(symbol: str, bars, entry_date):
     if len(bars) < SMA_EXIT_DAYS + 1:
         return False
 
     closes = [float(b.c) for b in bars]
-    last_close = closes[-1]
-    ma = sma(closes[-SMA_EXIT_DAYS:])
+    close_today = closes[-1]
+    exit_sma = sma(closes[-SMA_EXIT_DAYS:])
 
-    if ma is not None and last_close < ma:
+    if exit_sma is not None and close_today < exit_sma:
         return True
 
     if entry_date is not None:
@@ -172,45 +183,44 @@ def main():
 
     positions = list_positions_map()
 
-    # 1) exits first
+    # 1) Exits first
     for sym, pos in list(positions.items()):
         if sym not in SYMBOLS:
             continue
 
         try:
-            bars = get_daily_bars(sym, limit=max(SMA_EXIT_DAYS, BREAKOUT_LOOKBACK_DAYS) + 5)
+            bars = get_daily_bars(sym, limit=max(SMA_ENTRY_DAYS, SMA_EXIT_DAYS) + 5)
         except Exception as e:
             print(f"[DATA] Failed bars for {sym}: {e}")
             continue
 
-        entry_date = get_last_entry_date(sym, days_back=45)
+        entry_date = get_last_entry_date(sym, days_back=30)
         if should_exit(sym, bars, entry_date):
             close_position(sym)
 
+    # refresh after exits
     positions = list_positions_map()
     slots = MAX_POSITIONS - len(positions)
     if slots <= 0:
         print("No entry slots available.")
         return
 
+    # 2) Entries
     candidates = []
     for sym in SYMBOLS:
         if sym in positions:
             continue
 
         try:
-            bars = get_daily_bars(sym, limit=max(SMA_EXIT_DAYS, BREAKOUT_LOOKBACK_DAYS) + 5)
+            bars = get_daily_bars(sym, limit=max(SMA_ENTRY_DAYS, SMA_EXIT_DAYS) + 5)
         except Exception as e:
             print(f"[DATA] Failed bars for {sym}: {e}")
             continue
 
-        ok, ref_price = should_enter_long(sym, bars)
+        ok, ref_price, strength = should_enter_long(sym, bars)
         if not ok:
             continue
 
-        prev_window = bars[-(BREAKOUT_LOOKBACK_DAYS + 1):-1]
-        breakout_level = max(float(b.h) for b in prev_window)
-        strength = ref_price - breakout_level
         candidates.append((strength, sym, ref_price))
 
     candidates.sort(reverse=True, key=lambda x: x[0])
@@ -225,6 +235,7 @@ def main():
             print(f"[SKIP] {sym} qty=0")
             continue
 
+        print(f"[SIGNAL] {sym} strength={strength:.4%}")
         submit_bracket_buy(sym, qty, ref_price)
 
     print("Done.")
