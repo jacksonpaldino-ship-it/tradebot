@@ -13,16 +13,13 @@ SYMBOLS = [
     "QQQ", "SPY"
 ]
 
-# VERY LOOSE SETTINGS TO FORCE MORE TRADES
-SMA_ENTRY_DAYS = 3
-SMA_EXIT_DAYS = 3
+MAX_POSITIONS = 3
 MAX_HOLD_DAYS = 5
 
 RISK_PER_TRADE = 0.01
 STOP_PCT = 0.03
 TAKE_PROFIT_PCT = 0.06
-MAX_POSITIONS = 5
-MAX_NOTIONAL_PER_TRADE = 0.25
+MAX_NOTIONAL_PER_TRADE = 0.30
 
 RUN_AFTER_CLOSE_ONLY = True
 MIN_PRICE = 5.0
@@ -48,20 +45,16 @@ def get_clock():
     return api.get_clock()
 
 def get_equity():
-    acct = api.get_account()
-    return float(acct.equity)
+    return float(api.get_account().equity)
 
 def list_positions_map():
-    pos = {}
+    out = {}
     for p in api.list_positions():
-        pos[p.symbol] = p
-    return pos
+        out[p.symbol] = p
+    return out
 
 def get_daily_bars(symbol: str, limit: int):
     return list(api.get_bars(symbol, TimeFrame.Day, limit=limit))
-
-def sma(values):
-    return sum(values) / len(values) if values else None
 
 def calc_qty(equity: float, price: float):
     if price <= 0:
@@ -82,6 +75,7 @@ def calc_qty(equity: float, price: float):
 def get_last_entry_date(symbol: str, days_back: int = 30):
     after = (ny_now() - timedelta(days=days_back)).date().isoformat()
     acts = api.get_activities(activity_types="FILL", direction="desc", after=after)
+
     for a in acts:
         try:
             if getattr(a, "symbol", None) != symbol:
@@ -121,57 +115,41 @@ def submit_bracket_buy(symbol: str, qty: int, ref_price: float):
         print(f"[ENTRY] Failed BUY {symbol}: {e}")
 
 # ================== STRATEGY ==================
-def should_enter_long(symbol: str, bars):
+def score_symbol(symbol: str, bars):
     """
-    Very loose entry:
-    - enough bars
-    - price above yesterday close
-    - price above 3-day SMA
+    Validation mode:
+    score = today's % return from yesterday close
     """
-    need = max(SMA_ENTRY_DAYS, 3) + 1
-    if len(bars) < need:
-        return (False, None, None)
+    if len(bars) < 2:
+        return None
 
-    closes = [float(b.c) for b in bars]
-    close_today = closes[-1]
-    close_yesterday = closes[-2]
-    entry_sma = sma(closes[-SMA_ENTRY_DAYS:])
+    close_today = float(bars[-1].c)
+    close_yesterday = float(bars[-2].c)
 
-    if close_today < MIN_PRICE:
-        return (False, None, None)
+    if close_today < MIN_PRICE or close_yesterday <= 0:
+        return None
 
-    if entry_sma is None:
-        return (False, None, None)
+    return (close_today / close_yesterday) - 1.0, close_today
 
-    # strength score = daily percent move
-    strength = (close_today / close_yesterday) - 1.0
-
-    if close_today > close_yesterday and close_today > entry_sma:
-        return (True, close_today, strength)
-
-    return (False, None, None)
-
-def should_exit(symbol: str, bars, entry_date):
-    if len(bars) < SMA_EXIT_DAYS + 1:
-        return False
-
-    closes = [float(b.c) for b in bars]
-    close_today = closes[-1]
-    exit_sma = sma(closes[-SMA_EXIT_DAYS:])
-
-    if exit_sma is not None and close_today < exit_sma:
-        return True
-
+def should_exit(symbol: str, entry_date, top_symbols):
+    """
+    Exit if:
+    - held too long
+    - symbol is no longer in today's top ranked list
+    """
     if entry_date is not None:
         days_held = (ny_now().date() - entry_date).days
         if days_held >= MAX_HOLD_DAYS:
             return True
 
+    if symbol not in top_symbols:
+        return True
+
     return False
 
 # ================== MAIN ==================
 def main():
-    print(f"\n=== Swing Bot Run ({today_str()}) ===")
+    print(f"\n=== Validation Swing Bot Run ({today_str()}) ===")
 
     clock = get_clock()
     if RUN_AFTER_CLOSE_ONLY and clock.is_open:
@@ -183,53 +161,56 @@ def main():
 
     positions = list_positions_map()
 
-    # 1) Exits first
-    for sym, pos in list(positions.items()):
-        if sym not in SYMBOLS:
-            continue
-
+    # Rank all symbols by 1-day return
+    ranked = []
+    for sym in SYMBOLS:
         try:
-            bars = get_daily_bars(sym, limit=max(SMA_ENTRY_DAYS, SMA_EXIT_DAYS) + 5)
+            bars = get_daily_bars(sym, limit=3)
         except Exception as e:
             print(f"[DATA] Failed bars for {sym}: {e}")
             continue
 
+        scored = score_symbol(sym, bars)
+        if scored is None:
+            continue
+
+        strength, ref_price = scored
+        ranked.append((strength, sym, ref_price))
+
+    ranked.sort(reverse=True, key=lambda x: x[0])
+
+    if not ranked:
+        print("No ranked symbols. Data issue or market timing issue.")
+        return
+
+    target_symbols = [sym for _, sym, _ in ranked[:MAX_POSITIONS]]
+    print(f"Top symbols today: {target_symbols}")
+
+    # Exit anything no longer in top ranks or held too long
+    for sym in list(positions.keys()):
+        if sym not in SYMBOLS:
+            continue
+
         entry_date = get_last_entry_date(sym, days_back=30)
-        if should_exit(sym, bars, entry_date):
+        if should_exit(sym, entry_date, target_symbols):
             close_position(sym)
 
-    # refresh after exits
+    # Refresh after exits
     positions = list_positions_map()
+    current_symbols = set(positions.keys())
+
+    # Fill available slots with top-ranked names
     slots = MAX_POSITIONS - len(positions)
     if slots <= 0:
         print("No entry slots available.")
         return
 
-    # 2) Entries
-    candidates = []
-    for sym in SYMBOLS:
-        if sym in positions:
+    for strength, sym, ref_price in ranked:
+        if slots <= 0:
+            break
+        if sym in current_symbols:
             continue
 
-        try:
-            bars = get_daily_bars(sym, limit=max(SMA_ENTRY_DAYS, SMA_EXIT_DAYS) + 5)
-        except Exception as e:
-            print(f"[DATA] Failed bars for {sym}: {e}")
-            continue
-
-        ok, ref_price, strength = should_enter_long(sym, bars)
-        if not ok:
-            continue
-
-        candidates.append((strength, sym, ref_price))
-
-    candidates.sort(reverse=True, key=lambda x: x[0])
-
-    if not candidates:
-        print("No entry signals today.")
-        return
-
-    for strength, sym, ref_price in candidates[:slots]:
         qty = calc_qty(equity, ref_price)
         if qty <= 0:
             print(f"[SKIP] {sym} qty=0")
@@ -237,6 +218,7 @@ def main():
 
         print(f"[SIGNAL] {sym} strength={strength:.4%}")
         submit_bracket_buy(sym, qty, ref_price)
+        slots -= 1
 
     print("Done.")
 
