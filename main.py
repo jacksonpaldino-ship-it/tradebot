@@ -53,8 +53,25 @@ def list_positions_map():
         out[p.symbol] = p
     return out
 
-def get_daily_bars(symbol: str, limit: int):
-    return list(api.get_bars(symbol, TimeFrame.Day, limit=limit))
+def get_daily_bars(symbol: str, days_back: int = 10):
+    """
+    Explicit date range daily bars.
+    Much more reliable than a tiny limit call right after close.
+    """
+    end_dt = ny_now()
+    start_dt = end_dt - timedelta(days=days_back)
+
+    start_str = start_dt.strftime("%Y-%m-%d")
+    end_str = end_dt.strftime("%Y-%m-%d")
+
+    bars = api.get_bars(
+        symbol,
+        TimeFrame.Day,
+        start=start_str,
+        end=end_str,
+        adjustment="raw"
+    )
+    return list(bars)
 
 def calc_qty(equity: float, price: float):
     if price <= 0:
@@ -117,8 +134,8 @@ def submit_bracket_buy(symbol: str, qty: int, ref_price: float):
 # ================== STRATEGY ==================
 def score_symbol(symbol: str, bars):
     """
-    Validation mode:
-    score = today's % return from yesterday close
+    Very loose validation mode:
+    rank by today's close vs yesterday's close
     """
     if len(bars) < 2:
         return None
@@ -129,14 +146,10 @@ def score_symbol(symbol: str, bars):
     if close_today < MIN_PRICE or close_yesterday <= 0:
         return None
 
-    return (close_today / close_yesterday) - 1.0, close_today
+    strength = (close_today / close_yesterday) - 1.0
+    return strength, close_today
 
 def should_exit(symbol: str, entry_date, top_symbols):
-    """
-    Exit if:
-    - held too long
-    - symbol is no longer in today's top ranked list
-    """
     if entry_date is not None:
         days_held = (ny_now().date() - entry_date).days
         if days_held >= MAX_HOLD_DAYS:
@@ -161,14 +174,15 @@ def main():
 
     positions = list_positions_map()
 
-    # Rank all symbols by 1-day return
     ranked = []
     for sym in SYMBOLS:
         try:
-            bars = get_daily_bars(sym, limit=3)
+            bars = get_daily_bars(sym, days_back=10)
         except Exception as e:
             print(f"[DATA] Failed bars for {sym}: {e}")
             continue
+
+        print(f"[DEBUG] {sym} bars returned: {len(bars)}")
 
         scored = score_symbol(sym, bars)
         if scored is None:
@@ -180,13 +194,13 @@ def main():
     ranked.sort(reverse=True, key=lambda x: x[0])
 
     if not ranked:
-        print("No ranked symbols. Data issue or market timing issue.")
+        print("No ranked symbols. Daily bars still unavailable or schedule is too early.")
         return
 
     target_symbols = [sym for _, sym, _ in ranked[:MAX_POSITIONS]]
     print(f"Top symbols today: {target_symbols}")
 
-    # Exit anything no longer in top ranks or held too long
+    # exits
     for sym in list(positions.keys()):
         if sym not in SYMBOLS:
             continue
@@ -195,11 +209,10 @@ def main():
         if should_exit(sym, entry_date, target_symbols):
             close_position(sym)
 
-    # Refresh after exits
+    # refresh after exits
     positions = list_positions_map()
     current_symbols = set(positions.keys())
 
-    # Fill available slots with top-ranked names
     slots = MAX_POSITIONS - len(positions)
     if slots <= 0:
         print("No entry slots available.")
