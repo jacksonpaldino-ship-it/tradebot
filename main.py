@@ -53,23 +53,16 @@ def list_positions_map():
         out[p.symbol] = p
     return out
 
-def get_daily_bars(symbol: str, days_back: int = 10):
+def get_daily_bars(symbol: str, limit: int = 10):
     """
-    Explicit date range daily bars.
-    Much more reliable than a tiny limit call right after close.
+    Force IEX feed so free Alpaca accounts can access recent data.
     """
-    end_dt = ny_now()
-    start_dt = end_dt - timedelta(days=days_back)
-
-    start_str = start_dt.strftime("%Y-%m-%d")
-    end_str = end_dt.strftime("%Y-%m-%d")
-
     bars = api.get_bars(
         symbol,
         TimeFrame.Day,
-        start=start_str,
-        end=end_str,
-        adjustment="raw"
+        limit=limit,
+        adjustment="raw",
+        feed="iex",
     )
     return list(bars)
 
@@ -100,7 +93,9 @@ def get_last_entry_date(symbol: str, days_back: int = 30):
             if getattr(a, "side", "").lower() == "buy":
                 ts = getattr(a, "transaction_time", None)
                 if ts:
-                    return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(NY_TZ).date()
+                    return datetime.fromisoformat(
+                        ts.replace("Z", "+00:00")
+                    ).astimezone(NY_TZ).date()
         except Exception:
             continue
     return None
@@ -134,7 +129,7 @@ def submit_bracket_buy(symbol: str, qty: int, ref_price: float):
 # ================== STRATEGY ==================
 def score_symbol(symbol: str, bars):
     """
-    Very loose validation mode:
+    Validation mode:
     rank by today's close vs yesterday's close
     """
     if len(bars) < 2:
@@ -177,7 +172,7 @@ def main():
     ranked = []
     for sym in SYMBOLS:
         try:
-            bars = get_daily_bars(sym, days_back=10)
+            bars = get_daily_bars(sym, limit=10)
         except Exception as e:
             print(f"[DATA] Failed bars for {sym}: {e}")
             continue
@@ -194,7 +189,7 @@ def main():
     ranked.sort(reverse=True, key=lambda x: x[0])
 
     if not ranked:
-        print("No ranked symbols. Daily bars still unavailable or schedule is too early.")
+        print("No ranked symbols. If this still happens, the issue is not the signal anymore.")
         return
 
     target_symbols = [sym for _, sym, _ in ranked[:MAX_POSITIONS]]
